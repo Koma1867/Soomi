@@ -73,7 +73,6 @@ const (
 	MaxGamePly                         = 1024
 	ZobristSeed                        = 1070372
 	totalPhase                         = 24
-	contemptValue                      = -100
 )
 
 const (
@@ -2601,7 +2600,8 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pv *[]Move, tc *TimeCont
 		var score int
 
 		if p.isDraw() {
-			score = contemptValue
+			// A draw is worth exactly 0
+			score = 0
 		} else {
 			// Late move reductions & Principal variation search
 			childDepth := depth - 1
