@@ -59,6 +59,8 @@ const (
 	SEEPruneDepthMax                   = 8  // SEE prune only at depth <= this
 	SEEQuietCoeff                      = 80 // quiet margin: -coeff * depth
 	SEENoisyCoeff                      = 30 // capture margin: -coeff * depth * depth
+	LMPDepthMax                        = 4  // LMP only at depth <= this
+	LMPBase                            = 3  // quiet limit: LMPBase + depth * depth
 	defaultTTSizeMB                    = 256
 	scoreHash                          = 1000000
 	scorePromoBase                     = 900000
@@ -2569,6 +2571,13 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pv *[]Move, tc *TimeCont
 			fmt.Printf("info depth %d currmove %v currmovenumber %d\n", depth, m, legalMoves)
 		}
 		isQuiet := !m.isCapture() && !m.isPromo()
+
+		// LMP: at shallow depth, stop searching quiets once enough were tried
+		if depth <= LMPDepthMax && isQuiet && !inCheck &&
+			m != hashMove && bestScore > -Mate+MaxDepth &&
+			quietCount >= LMPBase+depth*depth {
+			continue
+		}
 
 		// SEE pruning: skip shallow moves that lose material
 		if depth <= SEEPruneDepthMax && legalMoves > 1 && !inCheck &&
