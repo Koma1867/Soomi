@@ -2510,12 +2510,10 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pv *[]Move, tc *TimeCont
 
 	// RFP check
 	if depth <= 8 && !inCheck && !p.isEndgame() {
-		if hashMove != 0 && !hashMove.isCapture() {
-			eval := p.evaluate()
-			// If we are far above beta, we can return soft fail
-			if eval >= beta+DeltaMargin*depth {
-				return eval
-			}
+		eval := p.evaluate()
+		// If we are far above beta, we can return soft fail
+		if eval >= beta+DeltaMargin*depth {
+			return eval
 		}
 	}
 
