@@ -56,6 +56,9 @@ const (
 	LMRMinChildDepth                   = 3
 	LMRLateMoveAfter                   = 3
 	MateScoreGuard                     = 1000
+	SEEPruneDepthMax                   = 8  // SEE prune only at depth <= this
+	SEEQuietCoeff                      = 80 // quiet margin: -coeff * depth
+	SEENoisyCoeff                      = 30 // capture margin: -coeff * depth * depth
 	defaultTTSizeMB                    = 256
 	scoreHash                          = 1000000
 	scorePromoBase                     = 900000
@@ -64,8 +67,6 @@ const (
 	scoreKiller2                       = 740000
 	scoreCountermove                   = 200000
 	minTimeMs            int64         = 5
-	perMoveCapDiv        int64         = 3
-	nextIterMult                       = 2
 	continueMargin       time.Duration = 10 * time.Millisecond
 	MaxGamePly                         = 1024
 	ZobristSeed                        = 1070372
@@ -2568,6 +2569,19 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pv *[]Move, tc *TimeCont
 			fmt.Printf("info depth %d currmove %v currmovenumber %d\n", depth, m, legalMoves)
 		}
 		isQuiet := !m.isCapture() && !m.isPromo()
+
+		// SEE pruning: skip shallow moves that lose material
+		if depth <= SEEPruneDepthMax && legalMoves > 1 && !inCheck &&
+			m != hashMove && !m.isPromo() && bestScore > -Mate+MaxDepth {
+			seeMargin := -SEENoisyCoeff * depth * depth
+			if isQuiet {
+				seeMargin = -SEEQuietCoeff * depth
+			}
+			if p.see(m) < seeMargin {
+				continue
+			}
+		}
+
 		if isQuiet {
 			quietsTried[quietCount] = m
 			quietCount++
@@ -2714,6 +2728,36 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pv *[]Move, tc *TimeCont
    2. Move Ordering: The BestMove from Depth X-1 is the first move searched at Depth X.
 */
 
+// printInfo emits one UCI info line. bound is "", "lowerbound" or "upperbound".
+func (p *Position) printInfo(depth, score int, pv []Move, elapsed time.Duration, bound string) {
+	nps := int64(0)
+	if elapsed > 0 {
+		nps = int64(float64(p.localNodes) / elapsed.Seconds())
+	}
+	if bound != "" {
+		bound = " " + bound
+	}
+	if abs(score) >= Mate-MateScoreGuard {
+		// Mate distance in moves, signed from our point of view
+		mateMoves := (Mate - abs(score) + 1) / 2
+		if score < 0 {
+			mateMoves = -mateMoves
+		}
+		fmt.Printf("info depth %d seldepth %d score mate %d%s nodes %d time %d nps %d hashfull %d",
+			depth, p.seldepth, mateMoves, bound, p.localNodes, elapsed.Milliseconds(), nps, tt.Hashfull())
+	} else {
+		fmt.Printf("info depth %d seldepth %d score cp %d%s nodes %d time %d nps %d hashfull %d",
+			depth, p.seldepth, score, bound, p.localNodes, elapsed.Milliseconds(), nps, tt.Hashfull())
+	}
+	if len(pv) > 0 {
+		fmt.Print(" pv")
+		for _, m := range pv {
+			fmt.Printf(" %v", m)
+		}
+	}
+	fmt.Println()
+}
+
 func (p *Position) search(tc *TimeControl) Move {
 	var bestMove Move
 	var ss [MaxDepth]SearchStack
@@ -2757,9 +2801,13 @@ func (p *Position) search(tc *TimeControl) Move {
 				}
 
 				if score <= low {
+					// Failed low: true score is at most this
+					p.printInfo(depth, score, pv, time.Since(start), "upperbound")
 					low -= window
 					window *= 2
 				} else if score >= high {
+					// Failed high: true score is at least this
+					p.printInfo(depth, score, pv, time.Since(start), "lowerbound")
 					high += window
 					window *= 2
 				} else {
@@ -2774,14 +2822,7 @@ func (p *Position) search(tc *TimeControl) Move {
 		} else {
 			score = p.negamax(depth, -Infinity, Infinity, 0, &pv, tc, &ss, 0)
 		}
-		iterNodes := p.localNodes
-
 		elapsed := time.Since(start)
-		elapsedMs := elapsed.Milliseconds()
-		nps := int64(0)
-		if elapsed > 0 {
-			nps = int64(float64(iterNodes) / elapsed.Seconds())
-		}
 
 		if tc.shouldStop() {
 			break
@@ -2800,26 +2841,7 @@ func (p *Position) search(tc *TimeControl) Move {
 		}
 
 		// Print search info
-		absScore := abs(score)
-		hashfull := tt.Hashfull()
-		if absScore >= Mate-MateScoreGuard {
-			matePly := Mate - absScore
-			mateMoves := (matePly + 1) / 2
-			if score > 0 {
-				fmt.Printf("info depth %d seldepth %d score mate %d nodes %d time %d nps %d hashfull %d pv",
-					depth, p.seldepth, mateMoves, iterNodes, elapsedMs, nps, hashfull)
-			} else {
-				fmt.Printf("info depth %d seldepth %d score mate -%d nodes %d time %d nps %d hashfull %d pv",
-					depth, p.seldepth, mateMoves, iterNodes, elapsedMs, nps, hashfull)
-			}
-		} else {
-			fmt.Printf("info depth %d seldepth %d score cp %d nodes %d time %d nps %d hashfull %d pv",
-				depth, p.seldepth, score, iterNodes, elapsedMs, nps, hashfull)
-		}
-		for _, m := range pv {
-			fmt.Printf(" %v", m)
-		}
-		fmt.Println()
+		p.printInfo(depth, score, pv, elapsed, "")
 
 		// Stability and score drop heuristics
 		scale := 1.0
@@ -3413,4 +3435,4 @@ func main() {
 }
 
 // To make an executable
-// set GOAMD64=v3 && go build -trimpath -ldflags "-s -w" -gcflags "all=-B" -o Soomi-V1.2.0B.exe soomi.go
+// set GOAMD64=v3 && go build -trimpath -ldflags "-s -w" -gcflags "all=-B" -o Soomi-V1.2.0B.exe Soomi.go
