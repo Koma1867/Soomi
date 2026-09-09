@@ -54,7 +54,7 @@ const (
 	NodeCheckMaskSearch                = 1023
 	DeltaMargin                        = 150
 	LMRMinChildDepth                   = 3
-	LMRLateMoveAfter                   = 6
+	LMRLateMoveAfter                   = 3
 	MateScoreGuard                     = 1000
 	defaultTTSizeMB                    = 256
 	scoreHash                          = 1000000
@@ -264,6 +264,8 @@ type Position struct {
 	pawnHash         uint64
 	kingSq           [2]int
 	phase            int
+	seldepth         int
+	searchStart      time.Time
 }
 
 type Undo struct {
@@ -283,6 +285,7 @@ type TimeControl struct {
 	movetime  int64
 	infinite  bool
 	depth     int
+	optimumMs int64
 	deadline  time.Time
 	stopped   int32
 }
@@ -619,6 +622,22 @@ func (t *TranspositionTable) Save(key uint64, mv Move, score int, depth int, fla
 	idx := int(key & t.mask)
 	newPacked := packEntry(uint32(mv), int16(score), uint8(t.gen), uint8(depth), flag)
 	t.entries[idx] = ttEntry{key: key, packed: newPacked}
+}
+
+func (t *TranspositionTable) Hashfull() int {
+	if t == nil || len(t.entries) == 0 {
+		return 0
+	}
+	sampleSize := min(1000, len(t.entries))
+	used := 0
+	gen := uint8(t.gen)
+	for i := 0; i < sampleSize; i++ {
+		e := t.entries[i]
+		if e.key != 0 && uint8(e.packed>>8) == gen {
+			used++
+		}
+	}
+	return (used * 1000) / sampleSize
 }
 
 func init() {
@@ -2296,6 +2315,9 @@ func (p *Position) orderMovesQ(moves []Move, scores []int) {
 */
 
 func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
+	if ply > p.seldepth {
+		p.seldepth = ply
+	}
 	if ply >= MaxDepth {
 		return p.evaluate()
 	}
@@ -2404,6 +2426,9 @@ func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
 */
 
 func (p *Position) negamax(depth, alpha, beta, ply int, pv *[]Move, tc *TimeControl, ss *[MaxDepth]SearchStack, prevMove Move) int {
+	if ply > p.seldepth {
+		p.seldepth = ply
+	}
 	if ply >= MaxDepth {
 		return p.evaluate()
 	}
@@ -2539,7 +2564,7 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pv *[]Move, tc *TimeCont
 			continue
 		}
 		legalMoves++
-		if ply == 0 && depth > 4 {
+		if ply == 0 && depth > 4 && time.Since(p.searchStart) >= 500*time.Millisecond {
 			fmt.Printf("info depth %d currmove %v currmovenumber %d\n", depth, m, legalMoves)
 		}
 		isQuiet := !m.isCapture() && !m.isPromo()
@@ -2700,10 +2725,16 @@ func (p *Position) search(tc *TimeControl) Move {
 
 	// Start timers
 	p.localNodes = 0
+	p.seldepth = 0
 	start := time.Now()
+	p.searchStart = start
 	var prevScore int
+	var prevBestMove Move
+	stableIterations := 0
+	lastIterElapsed := time.Duration(0)
 	var pvBuf [MaxDepth]Move
 	for depth := 1; depth <= maxDepth; depth++ {
+		p.seldepth = depth
 		pv := pvBuf[:0]
 		var score int
 
@@ -2743,7 +2774,6 @@ func (p *Position) search(tc *TimeControl) Move {
 		} else {
 			score = p.negamax(depth, -Infinity, Infinity, 0, &pv, tc, &ss, 0)
 		}
-		prevScore = score
 		iterNodes := p.localNodes
 
 		elapsed := time.Since(start)
@@ -2759,30 +2789,60 @@ func (p *Position) search(tc *TimeControl) Move {
 
 		if len(pv) > 0 {
 			bestMove = pv[0]
+			if depth > 1 {
+				if bestMove == prevBestMove {
+					stableIterations++
+				} else {
+					stableIterations = 0
+				}
+			}
+			prevBestMove = bestMove
 		}
 
 		// Print search info
 		absScore := abs(score)
+		hashfull := tt.Hashfull()
 		if absScore >= Mate-MateScoreGuard {
 			matePly := Mate - absScore
 			mateMoves := (matePly + 1) / 2
 			if score > 0 {
-				fmt.Printf("info depth %d score mate %d nodes %d time %d nps %d pv",
-					depth, mateMoves, iterNodes, elapsedMs, nps)
+				fmt.Printf("info depth %d seldepth %d score mate %d nodes %d time %d nps %d hashfull %d pv",
+					depth, p.seldepth, mateMoves, iterNodes, elapsedMs, nps, hashfull)
 			} else {
-				fmt.Printf("info depth %d score mate -%d nodes %d time %d nps %d pv",
-					depth, mateMoves, iterNodes, elapsedMs, nps)
+				fmt.Printf("info depth %d seldepth %d score mate -%d nodes %d time %d nps %d hashfull %d pv",
+					depth, p.seldepth, mateMoves, iterNodes, elapsedMs, nps, hashfull)
 			}
 		} else {
-			fmt.Printf("info depth %d score cp %d nodes %d time %d nps %d pv",
-				depth, score, iterNodes, elapsedMs, nps)
+			fmt.Printf("info depth %d seldepth %d score cp %d nodes %d time %d nps %d hashfull %d pv",
+				depth, p.seldepth, score, iterNodes, elapsedMs, nps, hashfull)
 		}
 		for _, m := range pv {
 			fmt.Printf(" %v", m)
 		}
 		fmt.Println()
 
-		if !tc.shouldContinue(elapsed) {
+		// Stability and score drop heuristics
+		scale := 1.0
+		if depth >= 5 {
+			if stableIterations >= 3 {
+				// Best move has remained stable for 3+ depths: save time!
+				scale *= 0.75
+			} else if stableIterations == 0 {
+				// Best move changed this iteration: invest more time!
+				scale *= 1.25
+			}
+
+			if prevScore != 0 && score < prevScore-40 {
+				// Unexpected score drop: think harder to find defense
+				scale *= 1.20
+			}
+		}
+		prevScore = score
+
+		iterTime := elapsed - lastIterElapsed
+		lastIterElapsed = elapsed
+
+		if !tc.shouldContinue(elapsed, iterTime, scale) {
 			break
 		}
 	}
@@ -2817,37 +2877,77 @@ func (tc *TimeControl) allocateTime(side int) {
 	if tc.infinite || tc.depth > 0 {
 		return
 	}
-	ms := tc.movetime
-	if ms <= 0 {
-		t, i, mtg := tc.wtime, tc.winc, int64(tc.movestogo)
-		if side == Black {
-			t, i = tc.btime, tc.binc
-		}
-		if mtg <= 0 {
-			mtg = DefaultMovesToGo
-		}
-		u := max(t-minTimeMs, 0)
-		ms = max(min(min(u/mtg, u/perMoveCapDiv)+i, u), min(minTimeMs, u))
+	if tc.movetime > 0 {
+		tc.optimumMs = tc.movetime
+		tc.deadline = time.Now().Add(time.Duration(tc.movetime) * time.Millisecond)
+		return
 	}
-	tc.deadline = time.Now().Add(time.Duration(ms) * time.Millisecond)
+
+	t, i, mtg := tc.wtime, tc.winc, int64(tc.movestogo)
+	if side == Black {
+		t, i = tc.btime, tc.binc
+	}
+	if mtg <= 0 {
+		mtg = DefaultMovesToGo
+	}
+
+	avail := max(t-minTimeMs, 0)
+	if avail <= 0 {
+		tc.optimumMs = minTimeMs
+		tc.deadline = time.Now().Add(time.Duration(minTimeMs) * time.Millisecond)
+		return
+	}
+
+	// Soft target: fair fraction of remaining time plus 3/4 of increment
+	optimum := avail/mtg + (i*3)/4
+	optimum = max(min(optimum, avail), minTimeMs)
+
+	// Hard emergency ceiling: up to 3.5x soft target, strictly capped at available time
+	maxTime := min(optimum*7/2, avail)
+	maxTime = max(maxTime, minTimeMs)
+
+	tc.optimumMs = optimum
+	tc.deadline = time.Now().Add(time.Duration(maxTime) * time.Millisecond)
 }
 
 func (tc *TimeControl) shouldStop() bool {
 	return atomic.LoadInt32(&tc.stopped) != 0 || (!tc.deadline.IsZero() && time.Until(tc.deadline) <= 0)
 }
 
-func (tc *TimeControl) shouldContinue(lastIter time.Duration) bool {
+func (tc *TimeControl) shouldContinue(elapsed, iterTime time.Duration, scale float64) bool {
 	if atomic.LoadInt32(&tc.stopped) != 0 {
 		return false
 	}
 
-	if tc.infinite || tc.depth > 0 || tc.movetime > 0 || lastIter <= 0 {
+	if tc.infinite || tc.depth > 0 || tc.movetime > 0 || tc.optimumMs <= 0 {
 		return true
 	}
 
-	remain := time.Until(tc.deadline)
-	minRequired := lastIter*nextIterMult + continueMargin
-	return remain > minRequired
+	softTarget := time.Duration(float64(tc.optimumMs)*scale) * time.Millisecond
+
+	// 1. Clean stop if soft time budget has been reached
+	if elapsed >= softTarget {
+		return false
+	}
+
+	// 2. Safety check against emergency hard deadline
+	remainHard := time.Until(tc.deadline)
+	if remainHard <= continueMargin {
+		return false
+	}
+
+	// 3. Project next iteration time (~2x the completed iteration)
+	projectedNext := iterTime * 2
+	if iterTime > 0 {
+		if elapsed+projectedNext > softTarget*3/2 {
+			return false
+		}
+		if projectedNext+continueMargin > remainHard {
+			return false
+		}
+	}
+
+	return true
 }
 
 /*
