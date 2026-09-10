@@ -1,7 +1,7 @@
 # Soomi Chess Engine (Go)
 
 <p align="center">
-  <img src="Soomi_logo.png" alt="Soomi Chess Engine Logo" width="1000">
+  <img src="Soomi.png" alt="Soomi Chess Engine Logo" width="1000">
 </p>
 
 <h1 align="center">Soomi Chess Engine</h1>
