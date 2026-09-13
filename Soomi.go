@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/bits"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,13 +81,9 @@ const (
 	FlagCapture       = 4
 	FlagEP            = 5
 	FlagCastle        = 2
-	FlagPromoN        = 8
-	FlagPromoB        = 9
-	FlagPromoR        = 10
+	FlagPromoN        = 8 // promotion flags: 8-11 quiet N,B,R,Q; 12-15 capturing N,B,R,Q
 	FlagPromoQ        = 11
 	FlagPromoCN       = 12
-	FlagPromoCB       = 13
-	FlagPromoCR       = 14
 	FlagPromoCQ       = 15
 	ttFlagExact uint8 = 0
 	ttFlagLower uint8 = 1
@@ -320,12 +317,11 @@ type SearchStack struct {
    Use mostly MG values                     Use mostly EG values
 */
 
-func (p *Position) computePhase() int {
+func (p *Position) computePhase() {
 	p.phase = totalPhase
 	for pt := Knight; pt <= Queen; pt++ {
 		p.phase -= bits.OnesCount64(uint64(p.pieces[White][pt]|p.pieces[Black][pt])) * piecePhase[pt]
 	}
-	return p.phase
 }
 
 func (p *Position) isEndgame() bool {
@@ -417,10 +413,6 @@ func (p *Position) isRepetition() bool {
 	return false
 }
 
-func (p *Position) isDraw() bool {
-	return p.halfmove >= 100 || p.isRepetition() || p.isInsufficientMaterial()
-}
-
 func (p *Position) isInsufficientMaterial() bool {
 	return (p.pieces[White][Pawn]|p.pieces[Black][Pawn]|p.pieces[White][Rook]|p.pieces[Black][Rook]|p.pieces[White][Queen]|p.pieces[Black][Queen]) == 0 && bits.OnesCount64(uint64(p.occupied[White])) <= 2 && bits.OnesCount64(uint64(p.occupied[Black])) <= 2
 }
@@ -428,20 +420,6 @@ func (p *Position) isInsufficientMaterial() bool {
 type ttEntry struct {
 	key    uint64
 	packed uint64
-}
-
-func packEntry(move uint32, score int16, gen uint8, depth uint8, flag uint8) uint64 {
-	return uint64(move)<<32 | uint64(uint16(score))<<16 | uint64(gen)<<8 | uint64(depth)<<2 | uint64(flag&0x3)
-}
-
-func (e ttEntry) unpack() (move uint32, score int16, gen uint8, depth uint8, flag uint8) {
-	p := e.packed
-	move = uint32(p >> 32)
-	score = int16(p >> 16)
-	gen = uint8(p >> 8)
-	depth = uint8((p >> 2) & 0x3F)
-	flag = uint8(p & 0x3)
-	return
 }
 
 /*
@@ -476,32 +454,11 @@ type TranspositionTable struct {
 // Example: You input setoption hash value 150. It will be rounded to 128.
 // Recommended values: 64, 128, 256, 512, 1024...
 func InitTT(sizeMB int) {
-	// A single ttEntry contains two uint64 variables (key and packed).
-	// Each uint64 is 8 bytes, so one entry takes exactly 16 bytes of RAM.
-	entrySize := uint64(16)
-
-	// Convert the requested size from Megabytes (MB) into exact Bytes.
-	// (1 MB = 1024 KB, 1 KB = 1024 Bytes).
-	totalBytes := uint64(sizeMB) * 1024 * 1024
-
-	// Calculate how much we can fit in that memory
-	entries := totalBytes / entrySize
-
-	// bits.Len64(entries) finds out how many bits it takes to represent in binary
-	// Then by subtracting 1 and bitshifting by 1 we force the number to round down to a power of 2.
-	// For example, if we have 100 entries, it goes down to 64.
-	size := uint64(1) << (bits.Len64(entries) - 1)
-
-	// Allocate table in memory
-	tt = &TranspositionTable{
-		// Create array with power of 2
-		entries: make([]ttEntry, int(size)),
-		// Due to size being calculated with our subtract and bitshift stuff,
-		// Subtracting 1 from it gives us a binary mask that we can use
-		// later with a AND instead of a modulo
-		// as modulo is much slower than AND
-		mask: size - 1,
-	}
+	// One ttEntry is two uint64s = 16 bytes. bits.Len64 finds how many bits the entry
+	// count needs; shifting 1 by one less rounds it down to a power of 2 (100 -> 64).
+	// size-1 is then a mask, so indexing can use AND instead of the much slower modulo.
+	size := uint64(1) << (bits.Len64(uint64(sizeMB)*1024*1024/16) - 1)
+	tt = &TranspositionTable{entries: make([]ttEntry, size), mask: size - 1}
 }
 
 func (t *TranspositionTable) Clear() {
@@ -514,27 +471,22 @@ func (t *TranspositionTable) Clear() {
 	}
 }
 
-func (t *TranspositionTable) Probe(key uint64, minDepth int) (Move, int, uint8, int, bool, bool) {
-	idx := int(key & t.mask)
-	e := t.entries[idx]
+// Probe decodes the packed word in place (layout above), which keeps it inlinable.
+func (t *TranspositionTable) Probe(key uint64, minDepth int) (move Move, score int, flag uint8, found, usable bool) {
+	e := t.entries[key&t.mask]
 	if e.key != key {
-		return 0, 0, 0, 0, false, false
+		return
 	}
-	move, score, gen, depth, flag := e.unpack()
-	if gen != uint8(t.gen) {
-		return Move(move), int(score), flag, int(depth), true, false
-	}
-	return Move(move), int(score), flag, int(depth), true, int(depth) >= minDepth
+	p := e.packed
+	return Move(p >> 32), int(int16(p >> 16)), uint8(p & 3), true, uint8(p>>8) == uint8(t.gen) && int(p>>2&0x3F) >= minDepth
 }
 
 // Save stores a search result into memory.
 // We use always replace, so we can get relevant entries
 // Its simple but can overwrite good entries with trash ones
 func (t *TranspositionTable) Save(key uint64, mv Move, score int, depth int, flag uint8) {
-	depth = min(depth, 63)
-	idx := int(key & t.mask)
-	newPacked := packEntry(uint32(mv), int16(score), uint8(t.gen), uint8(depth), flag)
-	t.entries[idx] = ttEntry{key: key, packed: newPacked}
+	packed := uint64(mv)<<32 | uint64(uint16(int16(score)))<<16 | uint64(uint8(t.gen))<<8 | uint64(uint8(min(depth, 63)))<<2 | uint64(flag&3)
+	t.entries[key&t.mask] = ttEntry{key: key, packed: packed}
 }
 
 // scoreToTT converts a mate score from distance-to-root to distance-to-this-node,
@@ -549,20 +501,15 @@ func scoreToTT(score, ply int) int {
 	return score
 }
 
+// Hashfull samples the first 1000 entries (the table always has at least 65536).
 func (t *TranspositionTable) Hashfull() int {
-	if t == nil || len(t.entries) == 0 {
-		return 0
-	}
-	sampleSize := min(1000, len(t.entries))
 	used := 0
-	gen := uint8(t.gen)
-	for i := 0; i < sampleSize; i++ {
-		e := t.entries[i]
-		if e.key != 0 && uint8(e.packed>>8) == gen {
+	for _, e := range t.entries[:1000] {
+		if e.key != 0 && uint8(e.packed>>8) == uint8(t.gen) {
 			used++
 		}
 	}
-	return (used * 1000) / sampleSize
+	return used
 }
 
 func init() {
@@ -631,16 +578,9 @@ func initEvaluation() {
 		fileMasks[i] = 0x0101010101010101 << i
 	}
 	for sq := 0; sq < 64; sq++ {
+		// King ring plus one more rank each way; bits shifted off the board drop out
 		mask := kingAttacks[sq] | sqBB[sq]
-		r := sq / 8
-		// Include squares in front
-		if r < 7 {
-			mask |= (mask << 8)
-		}
-		if r > 0 {
-			mask |= (mask >> 8)
-		}
-		kingZoneMask[sq] = mask
+		kingZoneMask[sq] = mask | mask<<8 | mask>>8
 	}
 }
 
@@ -967,15 +907,8 @@ func (p *Position) setFEN(fen string) {
 	// 3. Castling
 	if len(parts) >= 3 {
 		for _, ch := range parts[2] {
-			switch ch {
-			case 'K':
-				p.castle |= 1
-			case 'Q':
-				p.castle |= 2
-			case 'k':
-				p.castle |= 4
-			case 'q':
-				p.castle |= 8
+			if i := strings.IndexRune("KQkq", ch); i >= 0 {
+				p.castle |= 1 << i
 			}
 		}
 		p.hash ^= zobristCastleDiff[p.castle]
@@ -1000,16 +933,6 @@ func (p *Position) setFEN(fen string) {
 	p.historyPly = 0
 	p.lastIrreversible = 0
 	p.computePhase()
-}
-
-func (p *Position) pieceAt(sq int) (color, piece int, ok bool) {
-	val := p.square[sq]
-	if val < 0 {
-		return 0, 0, false
-	}
-	color = val >> 3
-	piece = val & 7
-	return color, piece, true
 }
 
 func rookAttacks(sq int, occ Bitboard) Bitboard {
@@ -1056,23 +979,11 @@ func (p *Position) inCheck() bool {
 func (p *Position) generateMovesTo(buf []Move, capturesOnly bool) int {
 	i := 0
 	us, them := p.side, p.side^1
+	occAll, occUs, occThem, ep := p.all, p.occupied[us], p.occupied[them], p.epSquare
+	push := 8 - 16*us // +8 for White, -8 for Black
+	promoRank, dblRank := 6-5*us, 1+5*us
 
-	occAll := p.all
-	occUs := p.occupied[us]
-	occThem := p.occupied[them]
-	ep := p.epSquare
-	pawns := p.pieces[us][Pawn]
-	var push, dblPush int
-	var promoRank, dblRank int
-	if us == White {
-		push, dblPush = 8, 16
-		promoRank, dblRank = 6, 1
-	} else {
-		push, dblPush = -8, -16
-		promoRank, dblRank = 1, 6
-	}
-
-	for bb := pawns; bb != 0; {
+	for bb := p.pieces[us][Pawn]; bb != 0; {
 		from := popLSB(&bb)
 		to := from + push
 
@@ -1094,8 +1005,8 @@ func (p *Position) generateMovesTo(buf []Move, capturesOnly bool) int {
 			if !capturesOnly && occAll&sqBB[to] == 0 {
 				buf[i] = makeMoves(from, to, FlagQuiet)
 				i++
-				if from>>3 == dblRank && occAll&sqBB[from+dblPush] == 0 {
-					buf[i] = makeMoves(from, from+dblPush, FlagQuiet)
+				if from>>3 == dblRank && occAll&sqBB[from+2*push] == 0 {
+					buf[i] = makeMoves(from, from+2*push, FlagQuiet)
 					i++
 				}
 			}
@@ -1142,9 +1053,8 @@ func (p *Position) generateMovesTo(buf []Move, capturesOnly bool) int {
 		}
 	}
 
-	if !capturesOnly && !p.inCheck() {
-		// castle bits: 1=K 2=Q 4=k 8=q; shift the side's pair down to bits 1 and 2
-		rights, base := p.castle>>(2*us), 56*us
+	// castle bits: 1=K 2=Q 4=k 8=q; shift the side's pair down to bits 1 and 2
+	if rights, base := p.castle>>(2*us), 56*us; !capturesOnly && rights&3 != 0 && !p.inCheck() {
 		if rights&1 != 0 && occAll&(Bitboard(0x60)<<base) == 0 {
 			buf[i] = makeMoves(base+4, base+6, FlagCastle)
 			i++
@@ -1199,8 +1109,7 @@ func (p *Position) makeMove(m Move) Undo {
 
 	from, to, flags := m.from(), m.to(), m.flags()
 	us, them := p.side, p.side^1
-	h := p.hash
-	h ^= zobristSide
+	h := p.hash ^ zobristSide
 
 	if p.epSquare >= 0 {
 		h ^= zobristEP[p.epSquare%8]
@@ -1230,12 +1139,6 @@ func (p *Position) makeMove(m Move) Undo {
 		p.psqScore[them] -= pst[them][capturedPiece][capSq]
 		p.psqScoreEG[them] -= pstEnd[them][capturedPiece][capSq]
 		p.square[capSq] = -1
-
-		p.halfmove = 0
-	} else if movingPiece == Pawn {
-		p.halfmove = 0
-	} else {
-		p.halfmove++
 	}
 
 	if flags == FlagCastle {
@@ -1249,10 +1152,8 @@ func (p *Position) makeMove(m Move) Undo {
 		p.square[from] = -1
 		p.square[to] = (us << 3) | King
 		p.kingSq[us] = to
-		var rf, rt int
-		if to > from {
-			rf, rt = from+3, from+1
-		} else {
+		rf, rt := from+3, from+1 // king side
+		if to < from {
 			rf, rt = from-4, from-1
 		}
 		rookBB := sqBB[rf] | sqBB[rt]
@@ -1314,11 +1215,11 @@ func (p *Position) makeMove(m Move) Undo {
 
 	h ^= zobristCastleDiff[undo.castle^p.castle]
 	p.side ^= 1
-	irreversible := (undo.captured >= 0) || (movingPiece == Pawn)
 	p.historyPly++
 	p.historyKeys[p.historyPly] = h
-
-	if irreversible {
+	p.halfmove++
+	if flags&FlagCapture != 0 || movingPiece == Pawn {
+		p.halfmove = 0
 		p.lastIrreversible = p.historyPly
 	}
 	p.hash = h
@@ -1327,8 +1228,7 @@ func (p *Position) makeMove(m Move) Undo {
 
 func (p *Position) unmakeMove(m Move, undo Undo) {
 	from, to, flags := m.from(), m.to(), m.flags()
-	us := p.side ^ 1
-	them := p.side
+	us, them := p.side^1, p.side
 	p.historyPly--
 	p.lastIrreversible = undo.lastIrreversible
 	p.side = us
@@ -1347,10 +1247,8 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 		p.square[from] = (us << 3) | King
 		p.kingSq[us] = from
 
-		var rf, rt int
-		if to > from {
-			rf, rt = from+1, from+3
-		} else {
+		rf, rt := from+1, from+3 // king side
+		if to < from {
 			rf, rt = from-1, from-4
 		}
 
@@ -1464,84 +1362,51 @@ func (p *Position) evalBishopPair() int {
 	return score
 }
 
+// see is the static exchange evaluation of m: the material balance after both
+// sides keep recapturing on m's target square with their least valuable attacker.
 func (p *Position) see(m Move) int {
 	from, to := m.from(), m.to()
-	piece := p.square[from] & 7
-	flags := m.flags()
-	gain0 := 0
-	if flags == FlagEP {
-		gain0 = pieceValues[Pawn]
-	} else if p.square[to] != -1 {
-		gain0 = pieceValues[p.square[to]&7]
-	}
-	pieceAfter := piece
-	if m.isPromo() {
-		pieceAfter = m.promoType()
-	}
-	return p.seeIterative(from, to, pieceAfter, gain0)
-}
-
-func (p *Position) seeIterative(from, to, pieceAfterFirst, gain0 int) int {
 	var gain [32]int
-	d := 0
-	// Pre-calculate slider masks
+	if m.flags() == FlagEP {
+		gain[0] = pieceValues[Pawn]
+	} else if p.square[to] != -1 {
+		gain[0] = pieceValues[p.square[to]&7]
+	}
+	piece := p.square[from] & 7
+	if m.isPromo() {
+		piece = m.promoType()
+	}
 	diagSliders := p.pieces[White][Bishop] | p.pieces[Black][Bishop] | p.pieces[White][Queen] | p.pieces[Black][Queen]
 	orthSliders := p.pieces[White][Rook] | p.pieces[Black][Rook] | p.pieces[White][Queen] | p.pieces[Black][Queen]
-
-	occ := p.all
-	att := p.getSEEAttackers(to, occ, diagSliders, orthSliders)
-
-	// First move (the move m passed to see)
-	us := p.side
-	gain[d] = gain0
-	piece := pieceAfterFirst
-
-	att &^= sqBB[from]
-	occ &^= sqBB[from]
-	// Any move can uncover X-ray sliders
-	att |= p.getXrayAttackers(to, occ, diagSliders, orthSliders)
-	us ^= 1
+	occ := p.all &^ sqBB[from]
+	att := pawnAttacks[White][to]&p.pieces[Black][Pawn] | pawnAttacks[Black][to]&p.pieces[White][Pawn] |
+		knightAttacks[to]&(p.pieces[White][Knight]|p.pieces[Black][Knight]) |
+		kingAttacks[to]&(p.pieces[White][King]|p.pieces[Black][King])
+	// The moved piece leaves, which can uncover x-ray sliders behind it
+	att = att&^sqBB[from] | p.getXrayAttackers(to, occ, diagSliders, orthSliders)
+	us, d := p.side^1, 0
 	for {
-		d++
 		myAtt := att & p.occupied[us]
-		var pt int
-		var attSq int
-		found := false
-		// Find smallest attacker for 'us'
-		for _, pType := range lvaOrder {
-			subset := myAtt & p.pieces[us][pType]
-			if subset != 0 {
-				pt = pType
-				attSq = bits.TrailingZeros64(uint64(subset))
-				found = true
-				break
-			}
+		i := 0 // least valuable attacker first
+		for i < len(lvaOrder) && myAtt&p.pieces[us][lvaOrder[i]] == 0 {
+			i++
 		}
-		if !found {
+		if i == len(lvaOrder) {
 			break
 		}
-
+		d++
 		gain[d] = pieceValues[piece] - gain[d-1]
-		piece = pt
-		att &^= sqBB[attSq]
-		occ &^= sqBB[attSq]
+		piece = lvaOrder[i]
+		bb := sqBB[bits.TrailingZeros64(uint64(myAtt&p.pieces[us][piece]))]
+		att &^= bb
+		occ &^= bb
 		att |= p.getXrayAttackers(to, occ, diagSliders, orthSliders)
 		us ^= 1
 	}
-
-	for d--; d > 0; d-- {
+	for ; d > 0; d-- {
 		gain[d-1] = -max(-gain[d-1], gain[d])
 	}
 	return gain[0]
-}
-
-func (p *Position) getSEEAttackers(sq int, occ, diagSliders, orthSliders Bitboard) Bitboard {
-	return (pawnAttacks[White][sq] & p.pieces[Black][Pawn] & occ) |
-		(pawnAttacks[Black][sq] & p.pieces[White][Pawn] & occ) |
-		(knightAttacks[sq] & (p.pieces[White][Knight] | p.pieces[Black][Knight]) & occ) |
-		(kingAttacks[sq] & (p.pieces[White][King] | p.pieces[Black][King]) & occ) |
-		(bishopAttacks(sq, occ) & diagSliders & occ) |
-		(rookAttacks(sq, occ) & orthSliders & occ)
 }
 
 func (p *Position) getXrayAttackers(sq int, occ, diagSliders, orthSliders Bitboard) Bitboard {
@@ -1649,18 +1514,13 @@ func (p *Position) evalKingSafety() int {
 				}
 			}
 		}
-		score := p.evalPawnShield(side, p.kingSq[side])
+		score := bits.OnesCount64(uint64(p.pieces[side][Pawn]&pawnShieldMask[side][p.kingSq[side]])) * bonusPawnShield
 		if attackers > 1 {
 			score -= attackUnits * attackUnits
 		}
 		mg += score * (1 - 2*side)
 	}
 	return mg
-}
-
-func (p *Position) evalPawnShield(side int, kingSq int) int {
-	pawns := p.pieces[side][Pawn]
-	return bits.OnesCount64(uint64(pawns&pawnShieldMask[side][kingSq])) * bonusPawnShield
 }
 
 func (p *Position) evalPawnStorm() int {
@@ -1854,18 +1714,13 @@ func sortByScore(moves []Move, scores []int) {
 */
 
 func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
-	if ply > p.seldepth {
-		p.seldepth = ply
-	}
+	p.seldepth = max(p.seldepth, ply)
 	if ply >= MaxDepth {
 		return p.evaluate()
 	}
 	p.localNodes++
-
-	if (p.localNodes & NodeCheckMaskSearch) == 0 {
-		if tc.shouldStop() {
-			return alpha
-		}
+	if p.localNodes&NodeCheckMaskSearch == 0 && tc.shouldStop() {
+		return alpha
 	}
 
 	inCheck := p.inCheck()
@@ -1875,10 +1730,7 @@ func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
 		if stand >= beta {
 			return stand
 		}
-		best = stand
-		if stand > alpha {
-			alpha = stand
-		}
+		best, alpha = stand, max(alpha, stand)
 		if !p.isEndgame() {
 			them := p.side ^ 1
 			maxGain := 0
@@ -1925,12 +1777,7 @@ func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
 		if score >= beta {
 			return beta
 		}
-		if score > best {
-			best = score
-		}
-		if score > alpha {
-			alpha = score
-		}
+		best, alpha = max(best, score), max(alpha, score)
 	}
 
 	if inCheck && legalCount == 0 {
@@ -1965,19 +1812,13 @@ func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
 */
 
 func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeControl, ss *[MaxDepth + 1]SearchStack, prevMove Move) int {
-	if ply > p.seldepth {
-		p.seldepth = ply
-	}
+	p.seldepth = max(p.seldepth, ply)
 	if ply >= MaxDepth {
 		return p.evaluate()
 	}
 	p.localNodes++
-
-	// Time check
-	if (p.localNodes & NodeCheckMaskSearch) == 0 {
-		if tc.shouldStop() {
-			return alpha
-		}
+	if p.localNodes&NodeCheckMaskSearch == 0 && tc.shouldStop() { // time check
+		return alpha
 	}
 
 	inCheck := p.inCheck()
@@ -1993,7 +1834,7 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 	// TT lookup
 	origAlpha := alpha
 	var hashMove Move
-	if move, score, flag, _, found, usable := tt.Probe(p.hash, depth); found {
+	if move, score, flag, found, usable := tt.Probe(p.hash, depth); found {
 		hashMove = move
 		if !pvNode {
 			// Mate scores are stored relative to this node and are usable at any depth
@@ -2111,7 +1952,7 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 		ss[ply+1].pvLen = 0
 		var score int
 
-		if p.isDraw() {
+		if p.halfmove >= 100 || p.isRepetition() || p.isInsufficientMaterial() {
 			// A draw is worth exactly 0
 			score = 0
 		} else {
@@ -2227,21 +2068,20 @@ func (p *Position) printInfo(depth, score int, pv []Move, elapsed time.Duration,
 	if elapsed > 0 {
 		nps = int64(float64(p.localNodes) / elapsed.Seconds())
 	}
-	if bound != "" {
-		bound = " " + bound
-	}
+	scoreStr := fmt.Sprintf("cp %d", score)
 	if abs(score) >= Mate-MateScoreGuard {
 		// Mate distance in moves, signed from our point of view
 		mateMoves := (Mate - abs(score) + 1) / 2
 		if score < 0 {
 			mateMoves = -mateMoves
 		}
-		fmt.Printf("info depth %d seldepth %d score mate %d%s nodes %d time %d nps %d hashfull %d",
-			depth, p.seldepth, mateMoves, bound, p.localNodes, elapsed.Milliseconds(), nps, tt.Hashfull())
-	} else {
-		fmt.Printf("info depth %d seldepth %d score cp %d%s nodes %d time %d nps %d hashfull %d",
-			depth, p.seldepth, score, bound, p.localNodes, elapsed.Milliseconds(), nps, tt.Hashfull())
+		scoreStr = fmt.Sprintf("mate %d", mateMoves)
 	}
+	if bound != "" {
+		scoreStr += " " + bound
+	}
+	fmt.Printf("info depth %d seldepth %d score %s nodes %d time %d nps %d hashfull %d",
+		depth, p.seldepth, scoreStr, p.localNodes, elapsed.Milliseconds(), nps, tt.Hashfull())
 	if len(pv) > 0 {
 		fmt.Print(" pv")
 		for _, m := range pv {
@@ -2401,26 +2241,20 @@ func (tc *TimeControl) allocateTime(side int) {
 	}
 
 	avail := max(t-minTimeMs, 0)
-	if avail <= 0 {
-		tc.optimumMs = minTimeMs
-		tc.deadline = time.Now().Add(time.Duration(minTimeMs) * time.Millisecond)
-		return
-	}
-
-	// Soft target: fair fraction of remaining time plus 3/4 of increment
-	optimum := avail/mtg + (i*3)/4
-	optimum = max(min(optimum, avail), minTimeMs)
-
+	// Soft target: fair fraction of remaining time plus 3/4 of increment.
+	// With nothing available both limits bottom out at minTimeMs, so no special case.
+	optimum := max(min(avail/mtg+(i*3)/4, avail), minTimeMs)
 	// Hard emergency ceiling: up to 3.5x soft target, strictly capped at available time
-	maxTime := min(optimum*7/2, avail)
-	maxTime = max(maxTime, minTimeMs)
+	maxTime := max(min(optimum*7/2, avail), minTimeMs)
 
 	tc.optimumMs = optimum
 	tc.deadline = time.Now().Add(time.Duration(maxTime) * time.Millisecond)
 }
 
 func (tc *TimeControl) shouldStop() bool {
-	return atomic.LoadInt32(&tc.stopped) != 0 || (!tc.deadline.IsZero() && time.Until(tc.deadline) <= 0)
+	// deadline is unset or built from time.Now(), so comparing with time.Time{} equals IsZero here
+	// and keeps this inlinable
+	return atomic.LoadInt32(&tc.stopped) != 0 || (tc.deadline != time.Time{} && time.Until(tc.deadline) <= 0)
 }
 
 func (tc *TimeControl) shouldContinue(elapsed, iterTime time.Duration, scale float64) bool {
@@ -2446,14 +2280,8 @@ func (tc *TimeControl) shouldContinue(elapsed, iterTime time.Duration, scale flo
 	}
 
 	// 3. Project next iteration time (~2x the completed iteration)
-	projectedNext := iterTime * 2
-	if iterTime > 0 {
-		if elapsed+projectedNext > softTarget*3/2 {
-			return false
-		}
-		if projectedNext+continueMargin > remainHard {
-			return false
-		}
+	if next := iterTime * 2; iterTime > 0 && (elapsed+next > softTarget*3/2 || next+continueMargin > remainHard) {
+		return false
 	}
 
 	return true
@@ -2488,41 +2316,30 @@ func (p *Position) perft(depth int) int {
 	if depth == 0 {
 		return 1
 	}
-
-	var movesArr [256]Move
-	n := p.generateMovesTo(movesArr[:], false)
+	var moves [256]Move
 	count := 0
-	for i := 0; i < n; i++ {
-		m := movesArr[i]
-		if !p.isLegal(m) {
-			continue
+	for _, m := range moves[:p.generateMovesTo(moves[:], false)] {
+		if p.isLegal(m) {
+			undo := p.makeMove(m)
+			count += p.perft(depth - 1)
+			p.unmakeMove(m, undo)
 		}
-		undo := p.makeMove(m)
-		count += p.perft(depth - 1)
-		p.unmakeMove(m, undo)
 	}
-
 	return count
 }
 
 func (p *Position) perftDivide(depth int) {
-	var movesArr [256]Move
-	n := p.generateMovesTo(movesArr[:], false)
+	var moves [256]Move
 	total := 0
-
-	for i := 0; i < n; i++ {
-		m := movesArr[i]
-		if !p.isLegal(m) {
-			continue
+	for _, m := range moves[:p.generateMovesTo(moves[:], false)] {
+		if p.isLegal(m) {
+			undo := p.makeMove(m)
+			count := p.perft(depth - 1)
+			p.unmakeMove(m, undo)
+			fmt.Printf("%v: %d\n", m, count)
+			total += count
 		}
-		undo := p.makeMove(m)
-		count := p.perft(depth - 1)
-		p.unmakeMove(m, undo)
-
-		fmt.Printf("%v: %d\n", m, count)
-		total += count
 	}
-
 	fmt.Printf("\nTotal: %d\n", total)
 }
 
@@ -2544,31 +2361,19 @@ func stopSearch() {
 }
 
 func parseSetOption(parts []string) (name, value string) {
-	nameStart, nameEnd, valueStart := -1, -1, -1
-	for i, p := range parts {
-		if p == "name" && nameStart == -1 {
-			nameStart = i + 1
-			continue
-		}
-		if p == "value" && nameStart != -1 && nameEnd == -1 {
-			nameEnd = i
-			valueStart = i + 1
-			break
-		}
-	}
-	if nameStart == -1 {
+	i := slices.Index(parts, "name")
+	if i < 0 {
 		return "", ""
 	}
-	if nameEnd == -1 {
-		return strings.Join(parts[nameStart:], " "), ""
-	}
-
-	if nameStart >= nameEnd {
+	rest := parts[i+1:]
+	j := slices.Index(rest, "value")
+	switch {
+	case j < 0:
+		return strings.Join(rest, " "), ""
+	case j == 0:
 		return "", ""
 	}
-	name = strings.Join(parts[nameStart:nameEnd], " ")
-	value = strings.Join(parts[valueStart:], " ")
-	return name, value
+	return strings.Join(rest[:j], " "), strings.Join(rest[j+1:], " ")
 }
 
 /*
@@ -2727,14 +2532,8 @@ func uciLoop() {
 			for r := 7; r >= 0; r-- {
 				fmt.Printf("%d|", r+1)
 				for f := 0; f < 8; f++ {
-					sq := r*8 + f
-					c, pt, ok := pos.pieceAt(sq)
-					if ok {
-						piece := "PNBRQK"[pt]
-						if c == Black {
-							piece += 32
-						}
-						fmt.Printf(" %c", piece)
+					if v := pos.square[r*8+f]; v >= 0 {
+						fmt.Printf(" %c", "PNBRQKpnbrqk"[(v>>3)*6+v&7])
 					} else {
 						fmt.Print(" .")
 					}
@@ -2775,12 +2574,11 @@ func uciLoop() {
 				expectedHash ^= zobristEP[pos.epSquare%8]
 			}
 			expectedPawnHash := uint64(0)
-			for sq := 0; sq < 64; sq++ {
-				c, pt, ok := pos.pieceAt(sq)
-				if ok {
-					expectedHash ^= zobristPiece[c][pt][sq]
-					if pt == Pawn {
-						expectedPawnHash ^= zobristPiece[c][Pawn][sq]
+			for sq, v := range pos.square {
+				if v >= 0 {
+					expectedHash ^= zobristPiece[v>>3][v&7][sq]
+					if v&7 == Pawn {
+						expectedPawnHash ^= zobristPiece[v>>3][Pawn][sq]
 					}
 				}
 			}
@@ -2810,10 +2608,8 @@ func uciLoop() {
 					if elapsed.Seconds() > 0 {
 						nps = int64(float64(count) / elapsed.Seconds())
 					}
-					timeStr := ""
-					if elapsed < time.Second {
-						timeStr = fmt.Sprintf("%d ms", elapsed.Milliseconds())
-					} else {
+					timeStr := fmt.Sprintf("%d ms", elapsed.Milliseconds())
+					if elapsed >= time.Second {
 						timeStr = fmt.Sprintf("%.2f s", elapsed.Seconds())
 					}
 					fmt.Printf("%-8d %-15d %-11s %d\n", depth, count, timeStr, nps)
