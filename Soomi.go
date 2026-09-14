@@ -2,10 +2,14 @@ package main
 
 import (
 	"bufio"
+	_ "embed"
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"math/bits"
 	"os"
+	"simd/archsimd"
 	"slices"
 	"strconv"
 	"strings"
@@ -46,34 +50,73 @@ const (
 */
 
 const (
-	MaxDepth                           = 50
-	Infinity                           = 30000
-	Mate                               = 29000
-	AspirationBase                     = 50
-	AspirationStartDepth               = 4
-	DefaultMovesToGo                   = 20
-	NodeCheckMaskSearch                = 1023
-	DeltaMargin                        = 150
-	LMRMinChildDepth                   = 3
-	LMRLateMoveAfter                   = 3
-	MateScoreGuard                     = 1000
-	SEEPruneDepthMax                   = 8  // SEE prune only at depth <= this
-	SEEQuietCoeff                      = 80 // quiet margin: -coeff * depth
-	SEENoisyCoeff                      = 30 // capture margin: -coeff * depth * depth
-	LMPDepthMax                        = 4  // LMP only at depth <= this
-	LMPBase                            = 3  // quiet limit: LMPBase + depth * depth
-	defaultTTSizeMB                    = 256
-	scoreHash                          = 1000000
-	scorePromoBase                     = 900000
-	scoreCaptureBase                   = 800000
-	scoreKiller1                       = 750000
-	scoreKiller2                       = 740000
-	scoreCountermove                   = 200000
-	minTimeMs            int64         = 5
-	continueMargin       time.Duration = 10 * time.Millisecond
-	MaxGamePly                         = 1024
-	ZobristSeed                        = 1070372
-	totalPhase                         = 24
+	EngineName          = "Soomi V1.3.0"
+	MaxDepth            = 50
+	Infinity            = 30000
+	Mate                = 29000
+	MateScoreGuard      = 1000
+	MaxGamePly          = 1024 // history entries: game plies (see setPosition) plus MaxDepth search plies
+	NodeCheckMaskSearch = 1023
+	defaultTTSizeMB     = 256
+	ZobristSeed         = 1070372
+	totalPhase          = 24
+	EndgamePhase        = 18 // isEndgame: more phase than this is gone
+)
+
+// Search parameters: every depth limit, margin and reduction the search uses.
+const (
+	AspirationStartDepth = 4
+	AspirationBase       = 50   // first window half-width, doubled after each fail
+	AspirationMaxWindow  = 1000 // once the window reaches this, search the full window
+	IIRDepthMin          = 4    // reduce by 1 ply without a hash move at depth >= this
+	RFPDepthMax          = 8
+	RFPMargin            = 150 // per ply of depth
+	NMPDepthMin          = 3
+	NMPReductionBase     = 3
+	NMPReductionDiv      = 6 // R = NMPReductionBase + depth/NMPReductionDiv
+	ProbCutDepthMin      = 5
+	ProbCutMargin        = 200
+	ProbCutReduction     = 4
+	LMRMinChildDepth     = 3
+	LMRLateMoveAfter     = 3
+	LMRBase              = 0.5
+	LMRDivisor           = 3.0 // reduction = LMRBase + ln(depth) * ln(move number) / LMRDivisor
+	LMPDepthMax          = 4   // LMP only at depth <= this
+	LMPBase              = 3   // quiet limit: LMPBase + depth * depth
+	SEEPruneDepthMax     = 8   // SEE prune only at depth <= this
+	SEEQuietCoeff        = 80  // quiet margin: -coeff * depth
+	SEENoisyCoeff        = 30  // capture margin: -coeff * depth * depth
+	DeltaMargin          = 150 // quiescence delta pruning
+	MaxHistory           = 16384
+	HistoryBonusMax      = 400
+)
+
+// Move ordering scores.
+const (
+	scoreHash        = 1000000
+	scorePromoBase   = 900000
+	scoreCaptureBase = 800000
+	scoreKiller1     = 750000
+	scoreKiller2     = 740000
+	scoreCountermove = 200000
+	MVVLVAWeight     = 100
+)
+
+// Time management (see allocateTime).
+const (
+	DefaultMovesToGo                    = 20
+	minTimeMs             int64         = 5
+	continueMargin        time.Duration = 10 * time.Millisecond
+	TMIncrementPct                      = 75  // the soft limit adds this much of the increment
+	TMHardLimitPct                      = 350 // the hard limit is this much of the soft limit
+	TMScaleMinDepth                     = 5   // stability and score-drop scaling start at this depth
+	TMStableIterations                  = 3
+	TMStableScale                       = 0.75 // best move unchanged for TMStableIterations
+	TMUnstableScale                     = 1.25 // best move changed this iteration
+	TMScoreDrop                         = 40   // a score this far below the previous iteration...
+	TMScoreDropScale                    = 1.20 // ...scales the soft limit by this
+	TMNextIterationFactor               = 2    // the next iteration is expected to take this many times the last
+	TMSoftOverrunPct                    = 150  // do not start an iteration expected to end past this much of the soft limit
 )
 
 const (
@@ -90,29 +133,9 @@ const (
 	ttFlagUpper uint8 = 2
 )
 
-const (
-	PhaseScale   = 256
-	MVVLVAWeight = 100
-	MaxHistory   = 16384
-	// pawnTableSize must be a power of 2 for bitwise AND mask to work.
-	pawnTableSize = 131072 // 4MB table (131072 * 32 bytes)
-)
-
-// pawnEntry caches the evaluation of a specific pawn structure.
-// Since pawns move very rarely compared to pieces, the pawn structure remains
-// identical across dozens of consecutive search nodes.
-// Same idea as tt, why evaluate if we know already?
-type pawnEntry struct {
-	key     uint64 // Zobrist hash of the pawn positions
-	mgScore int    // Middle-game score of this pawn structure
-	egScore int    // End-game score of this pawn structure
-}
-
 var (
-	pawnTable         []pawnEntry
 	pieceValues       = [6]int{89, 313, 317, 504, 1001, 20000}
 	pst               [2][6][64]int
-	pstEnd            [2][6][64]int
 	piecePhase        = [6]int{0, 1, 1, 2, 4, 0}
 	currentTC         atomic.Pointer[TimeControl]
 	searchWG          sync.WaitGroup
@@ -121,43 +144,16 @@ var (
 	bishopMagics      [64]MagicEntry
 	rookAttackTable   [102400]Bitboard
 	bishopAttackTable [5248]Bitboard
-	passedPawnBonus   = [8]int{0, 13, 14, 33, 55, 97, 154, 0}
-	mobilityBonus     = [4][]int{
-		{-14, 1, 9, 16, 23, 28, 31, 31, 19},                                                                              // Knight
-		{-13, -4, 6, 14, 21, 26, 29, 35, 38, 40, 38, 39, 27, 23},                                                         // Bishop
-		{-15, -2, 4, 11, 15, 21, 26, 30, 34, 38, 39, 42, 41, 37, 27},                                                     // Rook
-		{9, 9, 13, 17, 18, 24, 29, 32, 37, 38, 41, 44, 45, 46, 48, 51, 52, 55, 51, 48, 47, 34, 30, 12, 1, -34, -24, -53}, // Queen
-	}
-	kingZoneMask       [64]Bitboard
-	kingAttackerWeight = [6]int{0, 2, 1, 3, 3, 0} // P, N, B, R, Q, K (P and K usually 0 or special)
-	history            [2][64][64]int
-	countermoves       [2][64][64]Move
-	lmrTable           [MaxDepth + 1][256]int
-	lvaOrder           = [6]int{Pawn, Bishop, Knight, Rook, Queen, King}
-	castleMask         [64]int
-	pawnShieldMask     [2][64]Bitboard
-	fileMasks          [8]Bitboard
-	passedPawnMask     [2][64]Bitboard
-)
-
-const (
-	isolatedPawnPenalty   = 14
-	doubledPawnPenalty    = 9
-	bonusBishopPair       = 36
-	bonusRookOpenFile     = 18
-	bonusRookSemiOpenFile = 15
-	bonusPawnShield       = 15
-	penaltyPawnStorm      = 2
-	bonusKnightOutpost    = 31
-	penaltyKingTropism    = 3
-	bonusRookOn7th        = 17
+	lmrTable          [MaxDepth + 1][256]int
+	lvaOrder          = [6]int{Pawn, Bishop, Knight, Rook, Queen, King}
+	castleMask        [64]int
 )
 
 /*
   ----------------------------------------------------------------------------------
    MAGIC BITBOARDS
   ----------------------------------------------------------------------------------
-   Magic bitboards allows for instant sliding piece attacks
+   Magic bitboards give sliding piece attacks with a single table lookup
 
    The concept goes as follows
    1. Mask     A. Isolate relevant blocker squares for a piece at square X.
@@ -252,19 +248,14 @@ type Position struct {
 	epSquare         int
 	halfmove         int
 	hash             uint64
-	material         [2]int
-	psqScore         [2]int
-	psqScoreEG       [2]int
 	square           [64]int
 	historyKeys      [MaxGamePly]uint64
+	acc              [MaxGamePly][2][nnHidden]int16 // NNUE accumulators, indexed like historyKeys
+	nn               [MaxGamePly]nnPly              // each ply's accumulator change, applied lazily
 	historyPly       int
 	lastIrreversible int
-	localNodes       int64
-	pawnHash         uint64
 	kingSq           [2]int
 	phase            int
-	seldepth         int
-	searchStart      time.Time
 }
 
 type Undo struct {
@@ -296,27 +287,22 @@ type SearchStack struct {
 	pvLen   int
 }
 
-/*
-  ----------------------------------------------------------------------------------
-   TAPERED EVALUATION (Phase Calculation)
-  ----------------------------------------------------------------------------------
-   Chess strategy changes a lot as pieces are exchanged. We use a "Phase" variable
-   to interpolate between Middle Game (MG) and End Game (EG) scores.
-   This combats evaluation discontinuity, a major source of instability
+// Searcher is one search thread: its own copy of the position, the move ordering
+// tables it learns over a game, and the counters of the current search. The
+// transposition table is shared.
+type Searcher struct {
+	pos          Position
+	tc           *TimeControl
+	ss           [MaxDepth + 1]SearchStack
+	history      [2][64][64]int
+	countermoves [2][64][64]Move
+	nodes        int64
+	seldepth     int
+	start        time.Time
+}
 
-   Total Phase = 24 (Based on piece weights: N=1, B=1, R=2, Q=4)
-
-   Score Formula:
-      FinalScore = ( (MG_Score * Phase) + (EG_Score * (256 - Phase)) ) / 256
-
-      Start Position (all 32 pieces)       King vs King
-      (Phase = 256)                       (Phase = 0)
-      [========================================]
-      ^                                        ^
-      |                                        |
-   Use mostly MG values                     Use mostly EG values
-*/
-
+// phase counts the non-pawn material that is gone (N=1, B=1, R=2, Q=4): 0 with
+// every piece on the board, totalPhase (24) with none. Search uses it to spot endgames.
 func (p *Position) computePhase() {
 	p.phase = totalPhase
 	for pt := Knight; pt <= Queen; pt++ {
@@ -325,7 +311,7 @@ func (p *Position) computePhase() {
 }
 
 func (p *Position) isEndgame() bool {
-	return p.phase > 18
+	return p.phase > EndgamePhase
 }
 
 var (
@@ -437,7 +423,7 @@ type ttEntry struct {
 
    Lookup Process:
    1. Compute Zobrist Hash of current position.
-   2. Index = Hash % TableSize.
+   2. Index = Hash & (TableSize - 1); the size is a power of 2.
    3. Check if stored Key matches current Key.
    4. If Depth >= NeededDepth, use the stored Score immediately.
 */
@@ -481,9 +467,8 @@ func (t *TranspositionTable) Probe(key uint64, minDepth int) (move Move, score i
 	return Move(p >> 32), int(int16(p >> 16)), uint8(p & 3), true, uint8(p>>8) == uint8(t.gen) && int(p>>2&0x3F) >= minDepth
 }
 
-// Save stores a search result into memory.
-// We use always replace, so we can get relevant entries
-// Its simple but can overwrite good entries with trash ones
+// Save stores a search result, always replacing the old entry: simple, but a deep
+// result can be overwritten by a shallow one.
 func (t *TranspositionTable) Save(key uint64, mv Move, score int, depth int, flag uint8) {
 	packed := uint64(mv)<<32 | uint64(uint16(int16(score)))<<16 | uint64(uint8(t.gen))<<8 | uint64(uint8(min(depth, 63)))<<2 | uint64(flag&3)
 	t.entries[key&t.mask] = ttEntry{key: key, packed: packed}
@@ -517,42 +502,10 @@ func init() {
 	initPST()
 	initZobrist()
 	initSqBB()
-	initPawnShield()
-	initPassedPawnMask()
 	initAttacks()
 	initMagicBitboards()
-	initEvaluation()
 	initLMR()
 	InitTT(defaultTTSizeMB)
-	pawnTable = make([]pawnEntry, pawnTableSize)
-}
-
-func initPassedPawnMask() {
-	for sq := 0; sq < 64; sq++ {
-		r, f := sq/8, sq%8
-		for nf := max(0, f-1); nf <= min(7, f+1); nf++ {
-			for nr := r + 1; nr < 8; nr++ {
-				passedPawnMask[White][sq] |= sqBB[nr*8+nf]
-			}
-			for nr := r - 1; nr >= 0; nr-- {
-				passedPawnMask[Black][sq] |= sqBB[nr*8+nf]
-			}
-		}
-	}
-}
-
-func initPawnShield() {
-	for sq := 0; sq < 64; sq++ {
-		r, f := sq/8, sq%8
-		for nf := max(0, f-1); nf <= min(7, f+1); nf++ {
-			if r <= 2 {
-				pawnShieldMask[White][sq] |= sqBB[(r+1)*8+nf] | sqBB[(r+2)*8+nf]
-			}
-			if r >= 5 {
-				pawnShieldMask[Black][sq] |= sqBB[(r-1)*8+nf] | sqBB[(r-2)*8+nf]
-			}
-		}
-	}
 }
 
 func initCastleMask() {
@@ -567,23 +520,13 @@ func initCastleMask() {
 func initLMR() {
 	for d := 1; d <= MaxDepth; d++ {
 		for m := 1; m < 256; m++ {
-			val := 0.5 + math.Log(float64(d))*math.Log(float64(m))/3.0
+			val := LMRBase + math.Log(float64(d))*math.Log(float64(m))/LMRDivisor
 			lmrTable[d][m] = int(val)
 		}
 	}
 }
 
-func initEvaluation() {
-	for i := 0; i < 8; i++ {
-		fileMasks[i] = 0x0101010101010101 << i
-	}
-	for sq := 0; sq < 64; sq++ {
-		// King ring plus one more rank each way; bits shifted off the board drop out
-		mask := kingAttacks[sq] | sqBB[sq]
-		kingZoneMask[sq] = mask | mask<<8 | mask>>8
-	}
-}
-
+// pst is only used to order quiet moves that have no history yet (orderMoves).
 func initPST() {
 	pst[White][Pawn] = [64]int{
 		0, 0, 0, 0, 0, 0, 0, 0,
@@ -651,78 +594,10 @@ func initPST() {
 		-102, 144, 79, 112, 140, 220, 130, -34,
 	}
 
-	pstEnd[White][Pawn] = [64]int{
-		0, 0, 0, 0, 0, 0, 0, 0,
-		17, 13, 19, 6, 9, 22, 9, 17,
-		16, 13, 16, 12, 19, 22, 8, 13,
-		27, 22, 16, 11, 11, 13, 21, 21,
-		41, 35, 11, 15, 12, 14, 26, 28,
-		62, 48, 39, 24, 8, 42, 39, 41,
-		43, 55, 7, -21, -17, 45, 23, 27,
-		0, 0, 0, 0, 0, 0, 0, 0,
-	}
-
-	pstEnd[White][Knight] = [64]int{
-		-24, -38, -15, -23, -25, -22, -21, -20,
-		-58, -6, -15, -6, -6, -21, -20, -46,
-		-25, 6, -4, 4, 6, -1, -12, -15,
-		-7, -12, 14, 13, 11, 14, -4, -17,
-		-16, 1, 6, 13, 9, 7, 1, -11,
-		-14, -9, 7, 2, 3, -15, -6, -12,
-		0, -1, -1, -12, -1, -11, -3, -20,
-		-36, 0, -10, -18, -11, -14, -43, -87,
-	}
-
-	pstEnd[White][Bishop] = [64]int{
-		16, -23, -14, -6, -8, -8, -14, -8,
-		12, -14, -12, 1, -2, -2, -14, -10,
-		-9, 1, 4, 4, 10, -2, -6, 6,
-		-13, 7, 10, 3, -2, 11, -1, -12,
-		-5, -7, 0, 6, 9, -15, 7, -7,
-		-9, 2, 2, -3, 5, -4, -6, 10,
-		10, -1, 10, -13, -2, 4, 14, 0,
-		26, 2, 13, -2, 5, 6, 1, 32,
-	}
-
-	pstEnd[White][Rook] = [64]int{
-		1, -10, -10, -6, -12, -6, -12, -11,
-		2, -5, 2, -2, -4, -8, -13, 2,
-		4, 1, 11, 6, 9, 4, 0, -5,
-		16, 23, 28, 10, 8, 20, 11, 7,
-		22, 20, 15, 14, 5, 17, 19, 12,
-		27, 8, 16, 17, 8, 11, 6, 16,
-		24, 23, 24, 22, 12, 16, 26, 26,
-		22, 12, 9, 18, 13, 9, 2, 13,
-	}
-
-	pstEnd[White][Queen] = [64]int{
-		-33, -82, -80, -64, -88, -78, -115, -63,
-		-56, -53, -41, -60, -54, -83, -88, -83,
-		-21, -15, -1, 1, -10, 0, -12, -30,
-		-40, -6, 21, 34, 25, 18, 15, 3,
-		-18, 25, 9, 56, 24, 49, 50, 17,
-		-6, 0, 37, 20, 51, 18, 36, 27,
-		16, 30, 24, 24, 20, 19, 7, 13,
-		-9, -10, -19, 0, 12, 2, 9, -23,
-	}
-
-	pstEnd[White][King] = [64]int{
-		-59, -37, -27, -24, -26, -32, -31, -42,
-		-34, -17, -5, -7, -3, -6, -19, -23,
-		-11, -2, 8, 16, 18, 9, 4, -12,
-		-7, 18, 24, 29, 24, 26, 18, -3,
-		0, 37, 30, 42, 38, 31, 28, 10,
-		-3, 29, 37, 36, 28, 36, 54, 13,
-		-10, 7, 19, 21, 17, 33, 18, -17,
-		-79, -11, 21, -21, -8, -7, -3, -43,
-	}
-
 	// Mirror for black
 	for pt := 0; pt < 6; pt++ {
 		for sq := 0; sq < 64; sq++ {
-			bsq := sq ^ 56
-			pst[Black][pt][sq] = pst[White][pt][bsq]
-			pstEnd[Black][pt][sq] = pstEnd[White][pt][bsq]
+			pst[Black][pt][sq] = pst[White][pt][sq^56]
 		}
 	}
 }
@@ -856,83 +731,180 @@ func (p *Position) setStartPos() {
 	p.setFEN("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
 }
 
-func (p *Position) setFEN(fen string) {
+// setFEN sets up the position from a FEN: piece placement, side to move, castling
+// rights and en passant square, then the two optional clocks. It rejects positions
+// the move generator cannot handle. On error p is left half-built, so set up a
+// scratch Position when the current one must survive (uciLoop does).
+func (p *Position) setFEN(fen string) error {
+	parts := strings.Fields(fen)
+	if len(parts) < 4 || len(parts) > 6 {
+		return fmt.Errorf("expected 4 to 6 fields, got %d", len(parts))
+	}
 	*p = Position{}
 	for i := range p.square {
 		p.square[i] = -1
 	}
 	p.epSquare = -1
-	parts := strings.Fields(fen)
 
-	// 1. Da pieces
-	for r, rank := range strings.Split(parts[0], "/") {
+	// 1. Piece placement, rank 8 first
+	ranks := strings.Split(parts[0], "/")
+	if len(ranks) != 8 {
+		return fmt.Errorf("expected 8 ranks, got %d", len(ranks))
+	}
+	for r, rank := range ranks {
 		file := 0
 		for _, ch := range rank {
 			if ch >= '1' && ch <= '8' {
 				file += int(ch - '0')
 				continue
 			}
-			sq := (7-r)*8 + file
+			i := strings.IndexRune("PNBRQKpnbrqk", ch)
+			if i < 0 || file > 7 {
+				return fmt.Errorf("bad rank %q", rank)
+			}
+			color, pt, sq := i/6, i%6, (7-r)*8+file
 			file++
-			color := White
-			if ch >= 'a' {
-				color = Black
-				ch -= 32
-			}
-			pt := strings.IndexByte("PNBRQK", byte(ch))
-			if pt < 0 {
-				continue
-			}
 			bb := sqBB[sq]
 			p.pieces[color][pt] |= bb
 			p.occupied[color] |= bb
 			p.all |= bb
 			p.square[sq] = (color << 3) | pt
-			p.material[color] += pieceValues[pt]
-			p.psqScore[color] += pst[color][pt][sq]
-			p.psqScoreEG[color] += pstEnd[color][pt][sq]
 			p.hash ^= zobristPiece[color][pt][sq]
-			if pt == Pawn {
-				p.pawnHash ^= zobristPiece[color][Pawn][sq]
-			}
+		}
+		if file != 8 {
+			return fmt.Errorf("bad rank %q", rank)
 		}
 	}
-
-	// 2. Side to move
-	if len(parts) >= 2 && parts[1] == "b" {
-		p.side = Black
-		p.hash ^= zobristSide
-	}
-
-	// 3. Castling
-	if len(parts) >= 3 {
-		for _, ch := range parts[2] {
-			if i := strings.IndexRune("KQkq", ch); i >= 0 {
-				p.castle |= 1 << i
-			}
+	for c := White; c <= Black; c++ {
+		count := func(pt int) int { return bits.OnesCount64(uint64(p.pieces[c][pt])) }
+		promoted := max(count(Knight)-2, 0) + max(count(Bishop)-2, 0) + max(count(Rook)-2, 0) + max(count(Queen)-1, 0)
+		if count(King) != 1 || count(Pawn)+promoted > 8 {
+			return fmt.Errorf("each side needs one king and at most 8 pawns and promoted pieces together")
 		}
-		p.hash ^= zobristCastleDiff[p.castle]
 	}
-
-	// 4. The french pawn-move
-	if len(parts) >= 4 && parts[3] != "-" {
-		f, r := int(parts[3][0]-'a'), int(parts[3][1]-'1')
-		p.epSquare = r*8 + f
-		p.hash ^= zobristEP[f]
+	if (p.pieces[White][Pawn]|p.pieces[Black][Pawn])&0xFF000000000000FF != 0 {
+		return fmt.Errorf("pawn on the first or last rank")
 	}
-
-	// 5. Clock
-	if len(parts) >= 5 {
-		p.halfmove, _ = strconv.Atoi(parts[4])
-	}
-
-	// Extras
 	p.kingSq[White] = bits.TrailingZeros64(uint64(p.pieces[White][King]))
 	p.kingSq[Black] = bits.TrailingZeros64(uint64(p.pieces[Black][King]))
+
+	// 2. Side to move
+	switch parts[1] {
+	case "w":
+	case "b":
+		p.side = Black
+		p.hash ^= zobristSide
+	default:
+		return fmt.Errorf("bad side to move %q", parts[1])
+	}
+	if p.isAttacked(p.kingSq[p.side^1], p.side, p.all) {
+		return fmt.Errorf("the side not to move is in check")
+	}
+
+	// 3. Castling rights, each with its king and rook on their starting squares
+	if parts[2] != "-" {
+		for _, ch := range parts[2] {
+			i := strings.IndexRune("KQkq", ch)
+			if i < 0 {
+				return fmt.Errorf("bad castling rights %q", parts[2])
+			}
+			p.castle |= 1 << i
+		}
+	}
+	for i, rookSq := range [4]int{7, 0, 63, 56} {
+		c := i / 2
+		if p.castle>>i&1 != 0 && (p.square[56*c+4] != c<<3|King || p.square[rookSq] != c<<3|Rook) {
+			return fmt.Errorf("castling right %c without its king and rook at home", "KQkq"[i])
+		}
+	}
+	p.hash ^= zobristCastleDiff[p.castle]
+
+	// 4. En passant square, behind a pawn that just moved two squares
+	if ep := parts[3]; ep != "-" {
+		rank := 5 - 3*p.side // rank 6 with White to move, rank 3 with Black
+		if len(ep) != 2 || ep[0] < 'a' || ep[0] > 'h' || int(ep[1])-'1' != rank {
+			return fmt.Errorf("bad en passant square %q", ep)
+		}
+		p.epSquare = rank*8 + int(ep[0]-'a')
+		if p.square[p.epSquare] != -1 || p.square[p.epSquare^8] != (p.side^1)<<3|Pawn {
+			return fmt.Errorf("en passant square %s is not behind a pawn that just moved two squares", ep)
+		}
+		p.hash ^= zobristEP[p.epSquare%8]
+	}
+
+	// 5. Halfmove clock (for the fifty-move rule) and fullmove number (unused)
+	if len(parts) >= 5 {
+		n, err := strconv.Atoi(parts[4])
+		if err != nil || n < 0 {
+			return fmt.Errorf("bad halfmove clock %q", parts[4])
+		}
+		p.halfmove = n
+	}
+	if len(parts) == 6 {
+		if n, err := strconv.Atoi(parts[5]); err != nil || n < 0 {
+			return fmt.Errorf("bad fullmove number %q", parts[5])
+		}
+	}
+
 	p.historyKeys[0] = p.hash
-	p.historyPly = 0
-	p.lastIrreversible = 0
 	p.computePhase()
+	p.nnRefresh(&p.acc[0], White)
+	p.nnRefresh(&p.acc[0], Black)
+	p.nn[0].ready = [2]bool{true, true}
+	return nil
+}
+
+// setPosition applies the arguments of a UCI position command, "startpos" or
+// "fen <fen>", optionally followed by "moves <moves>". On error p is left half-built.
+func (p *Position) setPosition(args []string) error {
+	movesAt := slices.Index(args, "moves")
+	if movesAt < 0 {
+		movesAt = len(args)
+	}
+	switch {
+	case len(args) > 0 && args[0] == "startpos" && movesAt == 1:
+		p.setStartPos()
+	case len(args) > 0 && args[0] == "fen":
+		if err := p.setFEN(strings.Join(args[1:movesAt], " ")); err != nil {
+			return fmt.Errorf("invalid FEN: %w", err)
+		}
+	default:
+		return fmt.Errorf("expected startpos or fen <fen>")
+	}
+
+	var buf [256]Move
+	for _, s := range args[min(movesAt+1, len(args)):] {
+		n, found := p.generateMovesTo(buf[:], false), false
+		for _, m := range buf[:n] {
+			if strings.EqualFold(m.String(), s) && p.isLegal(m) {
+				p.makeMove(m)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("illegal move %s", s)
+		}
+		if p.historyPly > MaxGamePly-1-MaxDepth {
+			p.rebaseHistory()
+		}
+	}
+	return nil
+}
+
+// rebaseHistory moves the end of the game history to the front of the history
+// arrays, so a game can outgrow MaxGamePly with room left for a full-depth search.
+// Repetition detection needs nothing before the last irreversible move, nor more
+// than 100 plies: by then the fifty-move rule already scores the node as a draw.
+func (p *Position) rebaseHistory() {
+	keep := min(p.historyPly-p.lastIrreversible, 100)
+	shift := p.historyPly - keep
+	copy(p.historyKeys[:keep+1], p.historyKeys[shift:p.historyPly+1])
+	p.historyPly = keep
+	p.lastIrreversible = max(p.lastIrreversible-shift, 0)
+	p.nnRefresh(&p.acc[keep], White)
+	p.nnRefresh(&p.acc[keep], Black)
+	p.nn[keep].ready = [2]bool{true, true}
 }
 
 func rookAttacks(sq int, occ Bitboard) Bitboard {
@@ -1110,6 +1082,8 @@ func (p *Position) makeMove(m Move) Undo {
 	from, to, flags := m.from(), m.to(), m.flags()
 	us, them := p.side, p.side^1
 	h := p.hash ^ zobristSide
+	d := &p.nn[p.historyPly+1] // the accumulator change is recorded here, applied by nnBuild
+	d.nAdd, d.nSub = 0, 0
 
 	if p.epSquare >= 0 {
 		h ^= zobristEP[p.epSquare%8]
@@ -1131,13 +1105,8 @@ func (p *Position) makeMove(m Move) Undo {
 		p.occupied[them] &^= bb
 		p.all &^= bb
 		h ^= zobristPiece[them][capturedPiece][capSq]
-		if capturedPiece == Pawn {
-			p.pawnHash ^= zobristPiece[them][Pawn][capSq]
-		}
-		p.material[them] -= pieceValues[capturedPiece]
 		p.phase += piecePhase[capturedPiece]
-		p.psqScore[them] -= pst[them][capturedPiece][capSq]
-		p.psqScoreEG[them] -= pstEnd[them][capturedPiece][capSq]
+		d.removed(them, capturedPiece, capSq)
 		p.square[capSq] = -1
 	}
 
@@ -1147,11 +1116,11 @@ func (p *Position) makeMove(m Move) Undo {
 		p.occupied[us] ^= kingBB
 		p.all ^= kingBB
 		h ^= zobristPiece[us][King][from] ^ zobristPiece[us][King][to]
-		p.psqScore[us] += pst[us][King][to] - pst[us][King][from]
-		p.psqScoreEG[us] += pstEnd[us][King][to] - pstEnd[us][King][from]
 		p.square[from] = -1
 		p.square[to] = (us << 3) | King
 		p.kingSq[us] = to
+		d.added(us, King, to)
+		d.removed(us, King, from)
 		rf, rt := from+3, from+1 // king side
 		if to < from {
 			rf, rt = from-4, from-1
@@ -1161,8 +1130,8 @@ func (p *Position) makeMove(m Move) Undo {
 		p.occupied[us] ^= rookBB
 		p.all ^= rookBB
 		h ^= zobristPiece[us][Rook][rf] ^ zobristPiece[us][Rook][rt]
-		p.psqScore[us] += pst[us][Rook][rt] - pst[us][Rook][rf]
-		p.psqScoreEG[us] += pstEnd[us][Rook][rt] - pstEnd[us][Rook][rf]
+		d.added(us, Rook, rt)
+		d.removed(us, Rook, rf)
 		p.square[rf] = -1
 		p.square[rt] = (us << 3) | Rook
 
@@ -1173,19 +1142,11 @@ func (p *Position) makeMove(m Move) Undo {
 		p.pieces[us][promoType] ^= sqBB[to]
 		p.occupied[us] ^= moveBB
 		p.all ^= moveBB
-		h ^= zobristPiece[us][Pawn][from]
-		p.pawnHash ^= zobristPiece[us][Pawn][from]
-		p.material[us] -= pieceValues[Pawn]
-		p.psqScore[us] -= pst[us][Pawn][from]
-		p.psqScoreEG[us] -= pstEnd[us][Pawn][from]
-		p.square[from] = -1
-
-		h ^= zobristPiece[us][promoType][to]
-
-		p.material[us] += pieceValues[promoType]
+		h ^= zobristPiece[us][Pawn][from] ^ zobristPiece[us][promoType][to]
 		p.phase -= piecePhase[promoType]
-		p.psqScore[us] += pst[us][promoType][to]
-		p.psqScoreEG[us] += pstEnd[us][promoType][to]
+		d.removed(us, Pawn, from)
+		d.added(us, promoType, to)
+		p.square[from] = -1
 		p.square[to] = (us << 3) | promoType
 
 	} else {
@@ -1194,16 +1155,13 @@ func (p *Position) makeMove(m Move) Undo {
 		p.occupied[us] ^= moveBB
 		p.all ^= moveBB
 		h ^= zobristPiece[us][movingPiece][from] ^ zobristPiece[us][movingPiece][to]
-		if movingPiece == Pawn {
-			p.pawnHash ^= zobristPiece[us][Pawn][from] ^ zobristPiece[us][Pawn][to]
-		}
-		p.psqScore[us] += pst[us][movingPiece][to] - pst[us][movingPiece][from]
-		p.psqScoreEG[us] += pstEnd[us][movingPiece][to] - pstEnd[us][movingPiece][from]
 		p.square[from] = -1
 		p.square[to] = (us << 3) | movingPiece
 		if movingPiece == King {
 			p.kingSq[us] = to
 		}
+		d.added(us, movingPiece, to)
+		d.removed(us, movingPiece, from)
 
 		if movingPiece == Pawn && abs(to-from) == 16 {
 			p.epSquare = (from + to) / 2
@@ -1212,6 +1170,13 @@ func (p *Position) makeMove(m Move) Undo {
 	}
 
 	p.castle &= castleMask[from] & castleMask[to]
+	d.kingSq, d.ready = [2]int8{int8(p.kingSq[White]), int8(p.kingSq[Black])}, [2]bool{}
+	// A king crossing files d/e flips its own view's mirroring: rebuild that view now,
+	// while the board is at this ply. The other view stays lazy.
+	if movingPiece == King && (from&7 < 4) != (to&7 < 4) {
+		p.nnRefresh(&p.acc[p.historyPly+1], us)
+		d.ready[us] = true
+	}
 
 	h ^= zobristCastleDiff[undo.castle^p.castle]
 	p.side ^= 1
@@ -1241,8 +1206,6 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 		p.pieces[us][King] ^= kingBB
 		p.occupied[us] ^= kingBB
 		p.all ^= kingBB
-		p.psqScore[us] += pst[us][King][from] - pst[us][King][to]
-		p.psqScoreEG[us] += pstEnd[us][King][from] - pstEnd[us][King][to]
 		p.square[to] = -1
 		p.square[from] = (us << 3) | King
 		p.kingSq[us] = from
@@ -1256,8 +1219,6 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 		p.pieces[us][Rook] ^= rookBB
 		p.occupied[us] ^= rookBB
 		p.all ^= rookBB
-		p.psqScore[us] += pst[us][Rook][rt] - pst[us][Rook][rf]
-		p.psqScoreEG[us] += pstEnd[us][Rook][rt] - pstEnd[us][Rook][rf]
 		p.square[rf] = -1
 		p.square[rt] = (us << 3) | Rook
 
@@ -1268,16 +1229,9 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 		p.pieces[us][Pawn] ^= sqBB[from]
 		p.occupied[us] ^= moveBB
 		p.all ^= moveBB
-		p.material[us] -= pieceValues[promoType]
-		p.psqScore[us] -= pst[us][promoType][to]
-		p.psqScoreEG[us] -= pstEnd[us][promoType][to]
 		p.phase += piecePhase[promoType]
 		p.square[to] = -1
-		p.material[us] += pieceValues[Pawn]
-		p.psqScore[us] += pst[us][Pawn][from]
-		p.psqScoreEG[us] += pstEnd[us][Pawn][from]
 		p.square[from] = (us << 3) | Pawn
-		p.pawnHash ^= zobristPiece[us][Pawn][from]
 
 	} else {
 		movingPt := p.square[to] & 7
@@ -1285,16 +1239,10 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 		p.pieces[us][movingPt] ^= moveBB
 		p.occupied[us] ^= moveBB
 		p.all ^= moveBB
-		p.psqScore[us] += pst[us][movingPt][from] - pst[us][movingPt][to]
-		p.psqScoreEG[us] += pstEnd[us][movingPt][from] - pstEnd[us][movingPt][to]
 		p.square[to] = -1
 		p.square[from] = (us << 3) | movingPt
-		// Update da kingsq
 		if movingPt == King {
 			p.kingSq[us] = from
-		}
-		if movingPt == Pawn {
-			p.pawnHash ^= zobristPiece[us][Pawn][from] ^ zobristPiece[us][Pawn][to]
 		}
 	}
 
@@ -1308,14 +1256,8 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 		p.pieces[them][capturedPiece] |= bb
 		p.occupied[them] |= bb
 		p.all |= bb
-		p.material[them] += pieceValues[capturedPiece]
-		p.psqScore[them] += pst[them][capturedPiece][capSq]
-		p.psqScoreEG[them] += pstEnd[them][capturedPiece][capSq]
 		p.square[capSq] = (them << 3) | capturedPiece
 		p.phase -= piecePhase[capturedPiece]
-		if capturedPiece == Pawn {
-			p.pawnHash ^= zobristPiece[them][Pawn][capSq]
-		}
 	}
 	p.hash = p.historyKeys[p.historyPly]
 }
@@ -1334,6 +1276,7 @@ func (p *Position) makeNullMove() Undo {
 		p.epSquare = -1
 	}
 	p.halfmove++
+	p.nn[p.historyPly+1] = nnPly{kingSq: [2]int8{int8(p.kingSq[White]), int8(p.kingSq[Black])}} // nothing changed
 	p.historyPly++
 	p.historyKeys[p.historyPly] = p.hash
 	return undo
@@ -1345,21 +1288,6 @@ func (p *Position) unmakeNullMove(undo Undo) {
 	p.epSquare = undo.epSquare
 	p.halfmove = undo.halfmove
 	p.side ^= 1
-}
-
-func (p *Position) evalBishopPair() int {
-	score := 0
-	pawnCount := bits.OnesCount64(uint64(p.pieces[White][Pawn] | p.pieces[Black][Pawn]))
-	// Bishop pair is worth more in open positions (less pawns)
-	dynamicBonus := bonusBishopPair + (16-pawnCount)*2
-
-	if bits.OnesCount64(uint64(p.pieces[White][Bishop])) >= 2 {
-		score += dynamicBonus
-	}
-	if bits.OnesCount64(uint64(p.pieces[Black][Bishop])) >= 2 {
-		score -= dynamicBonus
-	}
-	return score
 }
 
 // see is the static exchange evaluation of m: the material balance after both
@@ -1413,201 +1341,243 @@ func (p *Position) getXrayAttackers(sq int, occ, diagSliders, orthSliders Bitboa
 	return (bishopAttacks(sq, occ) & diagSliders & occ) | (rookAttacks(sq, occ) & orthSliders & occ)
 }
 
-func updateHistory(side, from, to, bonus int) {
-	bonus = max(-400, min(400, bonus))
-	history[side][from][to] += bonus - history[side][from][to]*abs(bonus)/MaxHistory
+func (s *Searcher) updateHistory(side, from, to, bonus int) {
+	bonus = max(-HistoryBonusMax, min(HistoryBonusMax, bonus))
+	s.history[side][from][to] += bonus - s.history[side][from][to]*abs(bonus)/MaxHistory
 }
 
-func (p *Position) evalPawns() (mg, eg int) {
-	// Explained this during initTT, same logic here
-	idx := p.pawnHash & (pawnTableSize - 1)
-	entry := &pawnTable[idx]
+/*
+  ----------------------------------------------------------------------------------
+   NNUE EVALUATION
+  ----------------------------------------------------------------------------------
+   A small neural network trained on Soomi's own self-play games (nnue\DESIGN.md).
 
-	// Check if we have evaluated this same pawn struct before
-	if entry.key == p.pawnHash {
-		// We have evaluated this before, return cached score
-		return entry.mgScore, entry.egScore
+   board -> 768 inputs -> 128 sums x 2 views (SCReLU) -> 1 of 8 output buckets -> cp
+
+   Inputs:  one on/off feature per (colour, piece, square) as seen by one side:
+            own pieces 0-5, enemy pieces 6-11. Black's view is flipped top to bottom,
+            and a view whose own king stands on files e-h is also flipped left to
+            right, so every view sees its own king on files a-d.
+   Sums:    128 per view (the accumulator), same weights for both views. makeMove only
+            records which features changed; evaluate applies the pending changes
+            forward from the last built ply, so nodes that never evaluate cost nothing.
+            unmakeMove just steps historyPly back.
+   Speed:   the column and output loops use AVX2 through simd/archsimd, so Soomi.go
+            must be built with GOEXPERIMENT=simd. CPUs without AVX2 run scalar loops
+            that give identical results.
+   Output:  side to move's sums first, clamped to 0..1 and squared, mixed by the
+            output layer of bucket (pieces on board - 2) / 4.
+*/
+
+const (
+	nnInputs  = 768
+	nnHidden  = 128
+	nnBuckets = 8
+	nnQA      = 255 // accumulator weights and biases are stored x255
+	nnQB      = 64  // output weights are stored x64
+)
+
+//go:embed soomi.nnue
+var netData []byte
+
+var (
+	nnFtW   [nnInputs * nnHidden]int16 // one nnHidden-wide column per feature
+	nnFtB   [nnHidden]int16
+	nnOutW  [nnBuckets][2 * nnHidden]int16
+	nnOutB  [nnBuckets]int32
+	nnScale int // S: maps the net's output to centipawns
+	nnCRC   uint32
+)
+
+// loadNet parses a net file: a 20-byte header (magic "SNUE", then uint16 version,
+// flags, inputs, hidden, buckets, QA, QB, S), the weights in the order declared
+// above, all little-endian, and a CRC32 of everything before it.
+func loadNet(b []byte) error {
+	le := binary.LittleEndian
+	size := 20 + 2*(len(nnFtW)+len(nnFtB)+nnBuckets*2*nnHidden) + 4*nnBuckets + 4
+	if len(b) != size {
+		return fmt.Errorf("net is %d bytes, expected %d", len(b), size)
 	}
-
-	for side := White; side <= Black; side++ {
-		own, enemy, sign := p.pieces[side][Pawn], p.pieces[side^1][Pawn], 1-2*side
-		for bb := own; bb != 0; {
-			sq := popLSB(&bb)
-			file := sq % 8
-			penalty := 0
-			if own&fileMasks[file]&^sqBB[sq] != 0 { // doubled
-				penalty += doubledPawnPenalty
-			}
-			if (file == 0 || own&fileMasks[file-1] == 0) && (file == 7 || own&fileMasks[file+1] == 0) { // isolated
-				penalty += isolatedPawnPenalty
-			}
-			mg -= sign * penalty
-			eg -= sign * penalty
-			if enemy&passedPawnMask[side][sq] == 0 { // passed
-				bonus := passedPawnBonus[(sq/8)^(7*side)]
-				mg += sign * (bonus / 2)
-				eg += sign * bonus
+	if crc32.ChecksumIEEE(b[:size-4]) != le.Uint32(b[size-4:]) {
+		return fmt.Errorf("checksum mismatch, the file is corrupt")
+	}
+	if string(b[:4]) != "SNUE" || le.Uint16(b[4:]) != 1 || le.Uint16(b[6:]) != 1 || le.Uint16(b[8:]) != nnInputs ||
+		le.Uint16(b[10:]) != nnHidden || le.Uint16(b[12:]) != nnBuckets || le.Uint16(b[14:]) != nnQA || le.Uint16(b[16:]) != nnQB {
+		return fmt.Errorf("header does not match this engine (768 -> 128x2 -> 8 buckets, mirrored)")
+	}
+	nnScale = int(le.Uint16(b[18:]))
+	i := 20
+	read := func(dst []int16) {
+		for j := range dst {
+			dst[j] = int16(le.Uint16(b[i:]))
+			i += 2
+		}
+	}
+	read(nnFtW[:])
+	read(nnFtB[:])
+	for k := range nnOutW {
+		read(nnOutW[k][:])
+		for _, x := range nnOutW[k] {
+			if x < -128 || x > 128 { // the AVX2 eval needs 255*w to fit in int16
+				return fmt.Errorf("output weight %d is outside -128..128", x)
 			}
 		}
 	}
-
-	// Save the newly calculated scores into the pawn hash table.
-	// This uses always replace like tt
-	// because its simple, reliable mostly
-	// And these dont change that often usually
-	entry.key = p.pawnHash
-	entry.mgScore = mg
-	entry.egScore = eg
-
-	return mg, eg
+	for k := range nnOutB {
+		nnOutB[k] = int32(le.Uint32(b[i:]))
+		i += 4
+	}
+	nnCRC = le.Uint32(b[size-4:])
+	return nil
 }
 
-func (p *Position) evalMobility() (mg, eg int) {
-	// Squares attacked by enemy pawns do not count as mobility
-	danger := [2]Bitboard{
-		((p.pieces[Black][Pawn] & ^Bitboard(0x8080808080808080)) >> 7) | ((p.pieces[Black][Pawn] & ^Bitboard(0x0101010101010101)) >> 9),
-		((p.pieces[White][Pawn] & ^Bitboard(0x0101010101010101)) << 7) | ((p.pieces[White][Pawn] & ^Bitboard(0x8080808080808080)) << 9),
+// nnFeature is the input index of a colour-c piece pt on sq in view's accumulator;
+// kingSq is view's own king.
+func nnFeature(view, c, pt, sq, kingSq int) int {
+	if kingSq&7 >= 4 {
+		sq ^= 7
 	}
-	for side := White; side <= Black; side++ {
-		safe := ^p.occupied[side] & ^danger[side]
-		score := 0
-		for bb := p.pieces[side][Knight]; bb != 0; {
-			score += mobilityBonus[0][bits.OnesCount64(uint64(knightAttacks[popLSB(&bb)]&safe))]
-		}
-		for bb := p.pieces[side][Bishop]; bb != 0; {
-			score += mobilityBonus[1][bits.OnesCount64(uint64(bishopAttacks(popLSB(&bb), p.all)&safe))]
-		}
-		for bb := p.pieces[side][Rook]; bb != 0; {
-			score += mobilityBonus[2][bits.OnesCount64(uint64(rookAttacks(popLSB(&bb), p.all)&safe))]
-		}
-		for bb := p.pieces[side][Queen]; bb != 0; {
-			sq := popLSB(&bb)
-			score += mobilityBonus[3][bits.OnesCount64(uint64((bishopAttacks(sq, p.all)|rookAttacks(sq, p.all))&safe))]
-		}
-		mg += score * (1 - 2*side)
-	}
-	return mg, mg // mobilityBonus has no separate endgame table
+	return ((c^view)*6+pt)*64 + (sq ^ 56*view)
 }
 
-func (p *Position) evalKingSafety() int {
-	mg := 0
-	for side := White; side <= Black; side++ {
-		zone := kingZoneMask[p.kingSq[side]]
-		attackers, attackUnits := 0, 0
-		for pt := Knight; pt <= Queen; pt++ {
-			for bb := p.pieces[side^1][pt]; bb != 0; {
-				sq := popLSB(&bb)
-				var attacks Bitboard
-				switch pt {
-				case Knight:
-					attacks = knightAttacks[sq]
-				case Bishop:
-					attacks = bishopAttacks(sq, p.all)
-				case Rook:
-					attacks = rookAttacks(sq, p.all)
-				case Queen:
-					attacks = bishopAttacks(sq, p.all) | rookAttacks(sq, p.all)
+// nnSIMD selects the AVX2 loops. Without AVX2 the scalar loops run; both give
+// identical results.
+var nnSIMD = archsimd.X86.AVX2()
+
+func nnAddCol(a *[nnHidden]int16, f int) {
+	w := nnFtW[f*nnHidden : f*nnHidden+nnHidden]
+	if nnSIMD {
+		for i := 0; i < nnHidden; i += 16 {
+			archsimd.LoadInt16x16(a[i:]).Add(archsimd.LoadInt16x16(w[i:])).Store(a[i:])
+		}
+		return
+	}
+	for i := range a {
+		a[i] += w[i]
+	}
+}
+
+func nnSubCol(a *[nnHidden]int16, f int) {
+	w := nnFtW[f*nnHidden : f*nnHidden+nnHidden]
+	if nnSIMD {
+		for i := 0; i < nnHidden; i += 16 {
+			archsimd.LoadInt16x16(a[i:]).Sub(archsimd.LoadInt16x16(w[i:])).Store(a[i:])
+		}
+		return
+	}
+	for i := range a {
+		a[i] -= w[i]
+	}
+}
+
+// nnAddSubCol sets dst = src + column add - column sub; dst may be src.
+func nnAddSubCol(dst, src *[nnHidden]int16, add, sub int) {
+	wa, ws := nnFtW[add*nnHidden:add*nnHidden+nnHidden], nnFtW[sub*nnHidden:sub*nnHidden+nnHidden]
+	if nnSIMD {
+		for i := 0; i < nnHidden; i += 16 {
+			archsimd.LoadInt16x16(src[i:]).Add(archsimd.LoadInt16x16(wa[i:])).Sub(archsimd.LoadInt16x16(ws[i:])).Store(dst[i:])
+		}
+		return
+	}
+	for i := range dst {
+		dst[i] = src[i] + wa[i] - ws[i]
+	}
+}
+
+// nnRefresh rebuilds view's half of acc from the board.
+func (p *Position) nnRefresh(acc *[2][nnHidden]int16, view int) {
+	acc[view] = nnFtB
+	for c := White; c <= Black; c++ {
+		for pt := Pawn; pt <= King; pt++ {
+			for bb := p.pieces[c][pt]; bb != 0; {
+				nnAddCol(&acc[view], nnFeature(view, c, pt, popLSB(&bb), p.kingSq[view]))
+			}
+		}
+	}
+}
+
+// nnPly is what makeMove records instead of updating the accumulator: the pieces
+// added and removed, packed as (colour*6+piece)<<6 | square, both kings (they decide
+// each view's mirroring), and which views of acc at this ply are already built.
+// A null move adds and removes nothing.
+type nnPly struct {
+	add, sub   [2]int16
+	nAdd, nSub int8
+	kingSq     [2]int8
+	ready      [2]bool
+}
+
+func (d *nnPly) added(c, pt, sq int) {
+	d.add[d.nAdd] = int16((c*6+pt)<<6 | sq)
+	d.nAdd++
+}
+
+func (d *nnPly) removed(c, pt, sq int) {
+	d.sub[d.nSub] = int16((c*6+pt)<<6 | sq)
+	d.nSub++
+}
+
+// nnFeat is nnFeature for a piece packed by nnPly.
+func nnFeat(view int, piece int16, kingSq int8) int {
+	return nnFeature(view, int(piece>>6)/6, int(piece>>6)%6, int(piece&63), int(kingSq))
+}
+
+// nnBuild brings both views of the accumulator at historyPly up to date: it applies
+// the recorded changes forward from the nearest built ply (setFEN builds ply 0).
+func (p *Position) nnBuild() {
+	for v := White; v <= Black; v++ {
+		k := p.historyPly
+		for !p.nn[k].ready[v] {
+			k--
+		}
+		for k++; k <= p.historyPly; k++ {
+			d, dst := &p.nn[k], &p.acc[k][v]
+			if d.nAdd == 0 { // null move
+				*dst = p.acc[k-1][v]
+			} else {
+				nnAddSubCol(dst, &p.acc[k-1][v], nnFeat(v, d.add[0], d.kingSq[v]), nnFeat(v, d.sub[0], d.kingSq[v]))
+				if d.nAdd == 2 { // castling: the rook moved too
+					nnAddSubCol(dst, dst, nnFeat(v, d.add[1], d.kingSq[v]), nnFeat(v, d.sub[1], d.kingSq[v]))
+				} else if d.nSub == 2 { // a capture
+					nnSubCol(dst, nnFeat(v, d.sub[1], d.kingSq[v]))
 				}
-				if attacks&zone != 0 {
-					attackers++
-					attackUnits += kingAttackerWeight[pt]
-				}
 			}
-		}
-		score := bits.OnesCount64(uint64(p.pieces[side][Pawn]&pawnShieldMask[side][p.kingSq[side]])) * bonusPawnShield
-		if attackers > 1 {
-			score -= attackUnits * attackUnits
-		}
-		mg += score * (1 - 2*side)
-	}
-	return mg
-}
-
-func (p *Position) evalPawnStorm() int {
-	score := 0
-	for side := White; side <= Black; side++ {
-		kingSq, sign := p.kingSq[side], 1-2*side
-		for bb := p.pieces[side^1][Pawn] & passedPawnMask[side][kingSq]; bb != 0; {
-			dist := (popLSB(&bb)/8 - kingSq/8) * sign
-			score -= sign * penaltyPawnStorm * (6 - dist)
+			d.ready[v] = true
 		}
 	}
-	return score
 }
 
-func (p *Position) evalOutposts() (mg, eg int) {
-	// Knight and bishop outposts: relative rank 4-6, pawn-supported, and no enemy pawn can challenge
-	for side := White; side <= Black; side++ {
-		sign := 1 - 2*side
-		for pt := Knight; pt <= Bishop; pt++ {
-			bonus := bonusKnightOutpost
-			if pt == Bishop {
-				bonus /= 2
-			}
-			for bb := p.pieces[side][pt]; bb != 0; {
-				sq := popLSB(&bb)
-				if rel := (sq / 8) ^ (7 * side); rel >= 3 && rel <= 5 &&
-					pawnAttacks[side^1][sq]&p.pieces[side][Pawn] != 0 &&
-					p.pieces[side^1][Pawn]&passedPawnMask[side][sq]&^fileMasks[sq%8] == 0 {
-					mg += sign * bonus
-					eg += sign * (bonus / 2)
-				}
-			}
-		}
-	}
-	return mg, eg
-}
-
-func (p *Position) evalTropism() int {
-	score := 0
-	for side := White; side <= Black; side++ {
-		kr, kf := p.kingSq[side]/8, p.kingSq[side]%8
-		closeness := 0
-		for bb := p.occupied[side^1] &^ (p.pieces[side^1][Pawn] | p.pieces[side^1][King]); bb != 0; {
-			sq := popLSB(&bb)
-			closeness += 14 - (abs(sq/8-kr) + abs(sq%8-kf))
-		}
-		score -= (1 - 2*side) * penaltyKingTropism * closeness
-	}
-	return score
-}
-
-func (p *Position) evalRooksOnFiles() int {
-	score := 0
-	for side := White; side <= Black; side++ {
-		s := 0
-		enemyKingOnBackRank := (p.kingSq[side^1]/8)^(7*side) == 7
-		for bb := p.pieces[side][Rook]; bb != 0; {
-			sq := popLSB(&bb)
-			if file := fileMasks[sq%8]; p.pieces[side][Pawn]&file == 0 {
-				if p.pieces[side^1][Pawn]&file == 0 {
-					s += bonusRookOpenFile
-				} else {
-					s += bonusRookSemiOpenFile
-				}
-			}
-			if (sq/8)^(7*side) == 6 && enemyKingOnBackRank {
-				s += bonusRookOn7th
-			}
-		}
-		score += (1 - 2*side) * s
-	}
-	return score
-}
-
+// evaluate scores the position for the side to move, in centipawns.
 func (p *Position) evaluate() int {
-	pawnMG, pawnEG := p.evalPawns()
-	mobilityMG, mobilityEG := p.evalMobility()
-	outpostMG, outpostEG := p.evalOutposts()
-	// Terms scored the same in both phases
-	both := p.material[White] - p.material[Black] + p.evalBishopPair() + p.evalRooksOnFiles()
-	mgScore := both + p.psqScore[White] - p.psqScore[Black] + pawnMG + mobilityMG + outpostMG +
-		p.evalKingSafety() + p.evalTropism() + p.evalPawnStorm() +
-		20 - 40*p.side // tempo: +20 with White to move, -20 with Black
-	egScore := both + p.psqScoreEG[White] - p.psqScoreEG[Black] + pawnEG + mobilityEG + outpostEG
-	phaseScaled := ((totalPhase-p.phase)*PhaseScale + totalPhase/2) / totalPhase
-	score := egScore + ((mgScore-egScore)*phaseScaled)/PhaseScale
-	return score * (1 - 2*p.side) // side-to-move perspective
+	p.nnBuild()
+	acc := &p.acc[p.historyPly]
+	b := min((bits.OnesCount64(uint64(p.all))-2)/4, nnBuckets-1) // an illegal FEN can hold more than 32 pieces
+	sum := 0
+	if nnSIMD {
+		// Clamp to 0..255 and multiply by the weight (fits int16: 255*128), then
+		// VPMADDWD multiplies by the clamped value again and sums pairs into int32.
+		zero, top, s := archsimd.BroadcastInt16x16(0), archsimd.BroadcastInt16x16(nnQA), archsimd.BroadcastInt32x8(0)
+		for half, view := range [2]int{p.side, p.side ^ 1} {
+			a, w := acc[view][:], nnOutW[b][half*nnHidden:]
+			for i := 0; i < nnHidden; i += 16 {
+				c := archsimd.LoadInt16x16(a[i:]).Max(zero).Min(top)
+				s = s.Add(c.DotProductPairs(c.Mul(archsimd.LoadInt16x16(w[i:]))))
+			}
+		}
+		var lanes [8]int32
+		s.Store(lanes[:])
+		for _, x := range lanes {
+			sum += int(x)
+		}
+	} else {
+		us, them, w := &acc[p.side], &acc[p.side^1], &nnOutW[b]
+		for i := range us {
+			u, t := int(min(max(us[i], 0), nnQA)), int(min(max(them[i], 0), nnQA))
+			sum += u*u*int(w[i]) + t*t*int(w[nnHidden+i])
+		}
+	}
+	cp := (sum/nnQA + int(nnOutB[b])) * nnScale / (nnQA * nnQB)
+	return max(-(Mate - MateScoreGuard - 1), min(Mate-MateScoreGuard-1, cp))
 }
 
 /*
@@ -1617,20 +1587,22 @@ func (p *Position) evaluate() int {
    To prune the search tree effectively, we must search the best moves first.
 
    Sorting Priority List:
-   1. Hash Move      --> The best move found at the previous depth (da best)
-   2. Promotions     --> Queen promotions are tasty
-   3. Good Captures  --> Positive SEE captures sorted via MVV-LVA
-   4. Killer Moves   --> Quiet moves that caused a catoff in a sibling node
-   5. Countermoves   --> Moves that historically responded well to the previous move (arguments?)
-   6. History/PST    --> Moves that have been good in this game or improve PST position
+   1. Hash Move       --> The best move stored in the transposition table
+   2. Promotions      --> By the value of the promoted piece
+   3. Good Captures   --> Captures that do not lose material, by SEE and MVV-LVA
+   4. Killer Moves    --> Quiet moves that caused a cutoff at the same ply
+   5. Countermoves    --> The quiet move that last refuted the opponent's previous move
+   6. History/PST     --> Other quiet moves, by history plus a PST delta
+   7. Losing Captures --> Negative SEE, after the quiet moves
 */
 
-func clearHeuristics() {
-	history = [2][64][64]int{}
-	countermoves = [2][64][64]Move{}
+func (s *Searcher) clearHeuristics() {
+	s.history = [2][64][64]int{}
+	s.countermoves = [2][64][64]Move{}
 }
 
-func (p *Position) orderMoves(moves []Move, bestMove Move, killer1, killer2 Move, prevMove Move) []Move {
+func (s *Searcher) orderMoves(moves []Move, bestMove Move, killer1, killer2 Move, prevMove Move) []Move {
+	p := &s.pos
 	var stackScores [256]int
 	scores := stackScores[:len(moves)]
 	for i, m := range moves {
@@ -1647,8 +1619,8 @@ func (p *Position) orderMoves(moves []Move, bestMove Move, killer1, killer2 Move
 			from, to := m.from(), m.to()
 			pt := p.square[from] & 7
 			// History, plus a PST delta for moves without history
-			scores[i] = history[p.side][from][to] + pst[p.side][pt][to] - pst[p.side][pt][from]
-			if prevMove != 0 && m == countermoves[p.side][prevMove.from()][prevMove.to()] {
+			scores[i] = s.history[p.side][from][to] + pst[p.side][pt][to] - pst[p.side][pt][from]
+			if prevMove != 0 && m == s.countermoves[p.side][prevMove.from()][prevMove.to()] {
 				scores[i] += scoreCountermove
 			}
 		}
@@ -1713,13 +1685,14 @@ func sortByScore(moves []Move, scores []int) {
    Keep searching strictly through noisy moves until the position is "Quiet".
 */
 
-func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
-	p.seldepth = max(p.seldepth, ply)
+func (s *Searcher) quiesce(alpha, beta, ply int) int {
+	p := &s.pos
+	s.seldepth = max(s.seldepth, ply)
 	if ply >= MaxDepth {
 		return p.evaluate()
 	}
-	p.localNodes++
-	if p.localNodes&NodeCheckMaskSearch == 0 && tc.shouldStop() {
+	s.nodes++
+	if s.nodes&NodeCheckMaskSearch == 0 && s.tc.shouldStop() {
 		return alpha
 	}
 
@@ -1758,10 +1731,10 @@ func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
 
 	legalCount := 0
 	for i, m := range moves {
-		if tc.shouldStop() {
+		if s.tc.shouldStop() {
 			return alpha
 		}
-		// Prune bad caps, not in check so we dont prune check responses
+		// Prune losing captures, but never check evasions
 		if !inCheck && scores[i] < 0 {
 			continue
 		}
@@ -1771,7 +1744,7 @@ func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
 		legalCount++
 
 		undo := p.makeMove(m)
-		score := -p.quiesce(-beta, -alpha, ply+1, tc)
+		score := -s.quiesce(-beta, -alpha, ply+1)
 		p.unmakeMove(m, undo)
 
 		if score >= beta {
@@ -1800,24 +1773,28 @@ func (p *Position) quiesce(alpha, beta, ply int, tc *TimeControl) int {
         /         |        \
      ...         ...      (Pruned?)
 
-   Key Optimizations used here:
-   1. Transposition Table (TT): Cache results to avoid re-searching identical positions.
-   2. Null Move Pruning (NMP): "Pass" the move; if still safe, the position is too good (cutoff).
-   3. Late Move Reductions (LMR): Search moves that were ordered as less promising at lower depth first.
-   4. Quiescence Search: At leaf nodes, play out captures to avoid "horizon effects".
+   Techniques used here, in the order they run:
+   1. Check extension, then the Transposition Table (TT): reuse results of positions already searched.
+   2. Internal Iterative Reduction (IIR) and mate distance pruning.
+   3. Reverse Futility Pruning (RFP), Null Move Pruning (NMP) and ProbCut: cut nodes whose
+      static eval, a null move or a reduced search is already far enough above beta.
+   4. Late Move Pruning (LMP) and SEE pruning: skip late quiet moves and losing moves at low depth.
+   5. Principal Variation Search (PVS) with Late Move Reductions (LMR).
+   6. Quiescence Search: At leaf nodes, play out captures to avoid "horizon effects".
 
    Alpha (α): Best score the maximizing player can guarantee so far.
    Beta  (β): Best score the minimizing player can guarantee so far.
    Condition: If Score >= Beta, we have a "Cutoff" (branch is too good, opponent won't allow it).
 */
 
-func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeControl, ss *[MaxDepth + 1]SearchStack, prevMove Move) int {
-	p.seldepth = max(p.seldepth, ply)
+func (s *Searcher) negamax(depth, alpha, beta, ply int, pvNode bool, prevMove Move) int {
+	p := &s.pos
+	s.seldepth = max(s.seldepth, ply)
 	if ply >= MaxDepth {
 		return p.evaluate()
 	}
-	p.localNodes++
-	if p.localNodes&NodeCheckMaskSearch == 0 && tc.shouldStop() { // time check
+	s.nodes++
+	if s.nodes&NodeCheckMaskSearch == 0 && s.tc.shouldStop() { // time check
 		return alpha
 	}
 
@@ -1828,7 +1805,7 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 	}
 
 	if depth <= 0 {
-		return p.quiesce(alpha, beta, ply, tc)
+		return s.quiesce(alpha, beta, ply)
 	}
 
 	// TT lookup
@@ -1850,7 +1827,7 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 	}
 
 	// IIR
-	if depth >= 4 && hashMove == 0 {
+	if depth >= IIRDepthMin && hashMove == 0 {
 		depth--
 	}
 
@@ -1869,20 +1846,20 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 	}
 
 	// RFP check
-	if depth <= 8 && !inCheck && !p.isEndgame() {
+	if depth <= RFPDepthMax && !inCheck && !p.isEndgame() {
 		eval := p.evaluate()
 		// If we are far above beta, we can return soft fail
-		if eval >= beta+DeltaMargin*depth {
+		if eval >= beta+RFPMargin*depth {
 			return eval
 		}
 	}
 
 	// Adaptive Null Move Pruning
-	if depth >= 3 && !inCheck && !p.isEndgame() {
-		R := 3 + depth/6
+	if depth >= NMPDepthMin && !inCheck && !p.isEndgame() {
+		R := NMPReductionBase + depth/NMPReductionDiv
 
 		undo := p.makeNullMove()
-		score := -p.negamax(depth-1-R, -beta, -beta+1, ply+1, false, tc, ss, 0)
+		score := -s.negamax(depth-1-R, -beta, -beta+1, ply+1, false, 0)
 		p.unmakeNullMove(undo)
 
 		if score >= beta {
@@ -1891,10 +1868,10 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 	}
 
 	// ProbCut
-	if depth >= 5 && !inCheck && !p.isEndgame() {
-		probBeta := beta + 200
+	if depth >= ProbCutDepthMin && !inCheck && !p.isEndgame() {
+		probBeta := beta + ProbCutMargin
 		if probBeta <= Mate-MateScoreGuard {
-			score := p.negamax(depth-4, probBeta-1, probBeta, ply+1, false, tc, ss, prevMove)
+			score := s.negamax(depth-ProbCutReduction, probBeta-1, probBeta, ply+1, false, prevMove)
 			if score >= probBeta {
 				// Soft fail
 				return score
@@ -1904,7 +1881,7 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 
 	var movesArr [256]Move
 	n := p.generateMovesTo(movesArr[:], false)
-	moves := p.orderMoves(movesArr[:n], hashMove, ss[ply].killer1, ss[ply].killer2, prevMove)
+	moves := s.orderMoves(movesArr[:n], hashMove, s.ss[ply].killer1, s.ss[ply].killer2, prevMove)
 
 	bestMove := Move(0)
 	bestScore := -Infinity
@@ -1913,14 +1890,14 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 	quietCount := 0
 
 	for _, m := range moves {
-		if tc.shouldStop() {
+		if s.tc.shouldStop() {
 			return alpha
 		}
 		if !p.isLegal(m) {
 			continue
 		}
 		legalMoves++
-		if ply == 0 && depth > 4 && time.Since(p.searchStart) >= 500*time.Millisecond {
+		if ply == 0 && depth > 4 && time.Since(s.start) >= 500*time.Millisecond {
 			fmt.Printf("info depth %d currmove %v currmovenumber %d\n", depth, m, legalMoves)
 		}
 		isQuiet := !m.isCapture() && !m.isPromo()
@@ -1949,7 +1926,7 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 			quietCount++
 		}
 		undo := p.makeMove(m)
-		ss[ply+1].pvLen = 0
+		s.ss[ply+1].pvLen = 0
 		var score int
 
 		if p.halfmove >= 100 || p.isRepetition() || p.isInsufficientMaterial() {
@@ -1970,15 +1947,15 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 					if !pvNode {
 						red++
 					}
-					if history[p.side^1][m.from()][m.to()] < 0 {
+					if s.history[p.side^1][m.from()][m.to()] < 0 {
 						red++
 					}
 					d = max(1, childDepth-red)
 				}
-				score = -p.negamax(d, -alpha-1, -alpha, ply+1, false, tc, ss, m)
+				score = -s.negamax(d, -alpha-1, -alpha, ply+1, false, m)
 			}
 			if !zeroWindow || score > alpha {
-				score = -p.negamax(childDepth, -beta, -alpha, ply+1, pvNode, tc, ss, m)
+				score = -s.negamax(childDepth, -beta, -alpha, ply+1, pvNode, m)
 			}
 		}
 
@@ -1987,19 +1964,19 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 		if score >= beta {
 			// Update killers
 			if isQuiet && m != hashMove {
-				k := &ss[ply]
+				k := &s.ss[ply]
 				if m != k.killer1 {
 					k.killer2, k.killer1 = k.killer1, m
 				}
 				// History Bonus
 				bonus := depth * depth
-				updateHistory(p.side, m.from(), m.to(), bonus)
+				s.updateHistory(p.side, m.from(), m.to(), bonus)
 				// History Malus
 				for i := 0; i < quietCount-1; i++ {
-					updateHistory(p.side, quietsTried[i].from(), quietsTried[i].to(), -bonus)
+					s.updateHistory(p.side, quietsTried[i].from(), quietsTried[i].to(), -bonus)
 				}
 				// Countermove
-				countermoves[p.side][prevMove.from()][prevMove.to()] = m
+				s.countermoves[p.side][prevMove.from()][prevMove.to()] = m
 			}
 
 			// Store in transposition table
@@ -2017,8 +1994,8 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 		if score > alpha {
 			alpha = score
 			if pvNode {
-				n := copy(ss[ply].pv[1:], ss[ply+1].pv[:ss[ply+1].pvLen])
-				ss[ply].pv[0], ss[ply].pvLen = m, n+1
+				n := copy(s.ss[ply].pv[1:], s.ss[ply+1].pv[:s.ss[ply+1].pvLen])
+				s.ss[ply].pv[0], s.ss[ply].pvLen = m, n+1
 			}
 		}
 	}
@@ -2051,11 +2028,13 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
    Visual
    [Start]
     Search D=1 -> BestMove A
-	Search D=2 -> BestMove A (uses info from depth 1 to sort moves)
-	Search D=3 -> BestMove B (found a better move)
-	[Time Up!] -> Return result, even if iteration is unfinished. This is safe because even though its an unfinished iteration,
-	We searched the previous completed iteration fully, sorted that move as likely the best for this iteration as well,
-	so we either return that or an even better move.
+    Search D=2 -> BestMove A (uses info from depth 1 to sort moves)
+    Search D=3 -> BestMove B (found a better move)
+    [Time Up!] -> The unfinished iteration is thrown away; return the best move of the
+                  last completed one.
+
+   Depth 1 always completes: it ignores stop and the deadline (it takes well under a
+   millisecond), so with a legal move on the board there is always a searched move to report.
 
    Benefits:
    1. Time Management: We always have a "best move so far" if we must stop abruptly (as we do in chess).
@@ -2063,10 +2042,10 @@ func (p *Position) negamax(depth, alpha, beta, ply int, pvNode bool, tc *TimeCon
 */
 
 // printInfo emits one UCI info line. bound is "", "lowerbound" or "upperbound".
-func (p *Position) printInfo(depth, score int, pv []Move, elapsed time.Duration, bound string) {
+func (s *Searcher) printInfo(depth, score int, pv []Move, elapsed time.Duration, bound string) {
 	nps := int64(0)
 	if elapsed > 0 {
-		nps = int64(float64(p.localNodes) / elapsed.Seconds())
+		nps = int64(float64(s.nodes) / elapsed.Seconds())
 	}
 	scoreStr := fmt.Sprintf("cp %d", score)
 	if abs(score) >= Mate-MateScoreGuard {
@@ -2081,7 +2060,7 @@ func (p *Position) printInfo(depth, score int, pv []Move, elapsed time.Duration,
 		scoreStr += " " + bound
 	}
 	fmt.Printf("info depth %d seldepth %d score %s nodes %d time %d nps %d hashfull %d",
-		depth, p.seldepth, scoreStr, p.localNodes, elapsed.Milliseconds(), nps, tt.Hashfull())
+		depth, s.seldepth, scoreStr, s.nodes, elapsed.Milliseconds(), nps, tt.Hashfull())
 	if len(pv) > 0 {
 		fmt.Print(" pv")
 		for _, m := range pv {
@@ -2091,27 +2070,31 @@ func (p *Position) printInfo(depth, score int, pv []Move, elapsed time.Duration,
 	fmt.Println()
 }
 
-func (p *Position) search(tc *TimeControl) Move {
+func (s *Searcher) search(tc *TimeControl) Move {
 	var bestMove Move
-	var ss [MaxDepth + 1]SearchStack
+	s.ss = [MaxDepth + 1]SearchStack{}
 
 	maxDepth := tc.depth
-	if maxDepth == 0 || tc.infinite {
+	if maxDepth <= 0 || tc.infinite {
 		maxDepth = MaxDepth
 	}
 
 	// Start timers
-	p.localNodes = 0
-	p.seldepth = 0
+	s.nodes = 0
+	s.seldepth = 0
 	start := time.Now()
-	p.searchStart = start
+	s.start = start
 	var prevScore int
 	var prevBestMove Move
 	stableIterations := 0
 	lastIterElapsed := time.Duration(0)
 	for depth := 1; depth <= maxDepth; depth++ {
-		p.seldepth = depth
-		ss[0].pvLen = 0
+		s.tc = tc
+		if depth == 1 {
+			s.tc = &TimeControl{} // never stops, see above
+		}
+		s.seldepth = depth
+		s.ss[0].pvLen = 0
 		var score int
 
 		// Aspiration windows
@@ -2120,7 +2103,7 @@ func (p *Position) search(tc *TimeControl) Move {
 			low, high := prevScore-window, prevScore+window
 			for {
 				low, high = max(low, -Infinity), min(high, Infinity)
-				score = p.negamax(depth, low, high, 0, true, tc, &ss, 0)
+				score = s.negamax(depth, low, high, 0, true, 0)
 
 				if tc.shouldStop() {
 					break
@@ -2128,33 +2111,33 @@ func (p *Position) search(tc *TimeControl) Move {
 
 				if score <= low {
 					// Failed low: true score is at most this
-					p.printInfo(depth, score, ss[0].pv[:ss[0].pvLen], time.Since(start), "upperbound")
+					s.printInfo(depth, score, s.ss[0].pv[:s.ss[0].pvLen], time.Since(start), "upperbound")
 					low -= window
 					window *= 2
 				} else if score >= high {
 					// Failed high: true score is at least this
-					p.printInfo(depth, score, ss[0].pv[:ss[0].pvLen], time.Since(start), "lowerbound")
+					s.printInfo(depth, score, s.ss[0].pv[:s.ss[0].pvLen], time.Since(start), "lowerbound")
 					high += window
 					window *= 2
 				} else {
 					break
 				}
 
-				if window >= 1000 {
-					score = p.negamax(depth, -Infinity, Infinity, 0, true, tc, &ss, 0)
+				if window >= AspirationMaxWindow {
+					score = s.negamax(depth, -Infinity, Infinity, 0, true, 0)
 					break
 				}
 			}
 		} else {
-			score = p.negamax(depth, -Infinity, Infinity, 0, true, tc, &ss, 0)
+			score = s.negamax(depth, -Infinity, Infinity, 0, true, 0)
 		}
 		elapsed := time.Since(start)
 
-		if tc.shouldStop() {
+		if depth > 1 && tc.shouldStop() {
 			break
 		}
 
-		pv := ss[0].pv[:ss[0].pvLen]
+		pv := s.ss[0].pv[:s.ss[0].pvLen]
 		if len(pv) > 0 {
 			bestMove = pv[0]
 			if depth > 1 {
@@ -2168,22 +2151,22 @@ func (p *Position) search(tc *TimeControl) Move {
 		}
 
 		// Print search info
-		p.printInfo(depth, score, pv, elapsed, "")
+		s.printInfo(depth, score, pv, elapsed, "")
 
 		// Stability and score drop heuristics
 		scale := 1.0
-		if depth >= 5 {
-			if stableIterations >= 3 {
-				// Best move has remained stable for 3+ depths: save time!
-				scale *= 0.75
+		if depth >= TMScaleMinDepth {
+			if stableIterations >= TMStableIterations {
+				// Best move has remained stable: save time!
+				scale *= TMStableScale
 			} else if stableIterations == 0 {
 				// Best move changed this iteration: invest more time!
-				scale *= 1.25
+				scale *= TMUnstableScale
 			}
 
-			if prevScore != 0 && score < prevScore-40 {
+			if prevScore != 0 && score < prevScore-TMScoreDrop {
 				// Unexpected score drop: think harder to find defense
-				scale *= 1.20
+				scale *= TMScoreDropScale
 			}
 		}
 		prevScore = score
@@ -2198,29 +2181,25 @@ func (p *Position) search(tc *TimeControl) Move {
 	return bestMove
 }
 
-// -------------------------------------------
-// TIME CONTROL
-// -------------------------------------------
-func (tc *TimeControl) Stop() {
-	atomic.StoreInt32(&tc.stopped, 1)
-}
-
 /*
   ----------------------------------------------------------------------------------
-   TIME MANAGEMENT HEURISTICS
+   TIME MANAGEMENT
   ----------------------------------------------------------------------------------
-   Deciding how much time to spend on a move is hard balance to find.
+   Deciding how much time to spend on a move is a hard balance.
    - Too little: We play hasty, weak moves.
    - Too much: We likely flag (run out of time) later in the game.
 
-   Strategy:
-   1. Moves To Go: Assume the game lasts ~20-30-40 more moves (Can be whatever you like).
-   2. Increment: Always safely bank on the increment (winc/binc).
-   3. Safety Buffer: Subtract a margin (minTimeMs) to account for possible GUI lag.
-
-   Formula:
-    TimeForMove = (RemainingTime / MovesToGo) + Increment
+   Each move gets two limits, after keeping minTimeMs back for GUI lag:
+   1. Soft limit (optimumMs): RemainingTime / MovesToGo + TMIncrementPct% of the increment,
+      MovesToGo defaulting to DefaultMovesToGo. Iterative deepening stops between
+      iterations once past it, scaled by best move stability and score drops.
+   2. Hard limit (deadline): TMHardLimitPct% of the soft limit, never more than the time
+      left. The search stops mid-iteration when it is reached.
 */
+
+func (tc *TimeControl) Stop() {
+	atomic.StoreInt32(&tc.stopped, 1)
+}
 
 func (tc *TimeControl) allocateTime(side int) {
 	if tc.infinite || tc.depth > 0 {
@@ -2241,11 +2220,11 @@ func (tc *TimeControl) allocateTime(side int) {
 	}
 
 	avail := max(t-minTimeMs, 0)
-	// Soft target: fair fraction of remaining time plus 3/4 of increment.
+	// Soft target: fair fraction of remaining time plus part of the increment.
 	// With nothing available both limits bottom out at minTimeMs, so no special case.
-	optimum := max(min(avail/mtg+(i*3)/4, avail), minTimeMs)
-	// Hard emergency ceiling: up to 3.5x soft target, strictly capped at available time
-	maxTime := max(min(optimum*7/2, avail), minTimeMs)
+	optimum := max(min(avail/mtg+i*TMIncrementPct/100, avail), minTimeMs)
+	// Hard emergency ceiling: a multiple of the soft target, strictly capped at available time
+	maxTime := max(min(optimum*TMHardLimitPct/100, avail), minTimeMs)
 
 	tc.optimumMs = optimum
 	tc.deadline = time.Now().Add(time.Duration(maxTime) * time.Millisecond)
@@ -2279,8 +2258,8 @@ func (tc *TimeControl) shouldContinue(elapsed, iterTime time.Duration, scale flo
 		return false
 	}
 
-	// 3. Project next iteration time (~2x the completed iteration)
-	if next := iterTime * 2; iterTime > 0 && (elapsed+next > softTarget*3/2 || next+continueMargin > remainHard) {
+	// 3. Project next iteration time from the completed iteration
+	if next := iterTime * TMNextIterationFactor; iterTime > 0 && (elapsed+next > softTarget*TMSoftOverrunPct/100 || next+continueMargin > remainHard) {
 		return false
 	}
 
@@ -2343,9 +2322,9 @@ func (p *Position) perftDivide(depth int) {
 	fmt.Printf("\nTotal: %d\n", total)
 }
 
-func runSearchAndReport(p *Position, tc *TimeControl) {
+func runSearchAndReport(s *Searcher, tc *TimeControl) {
 	defer searchWG.Done()
-	move := p.search(tc)
+	move := s.search(tc)
 	if !currentTC.CompareAndSwap(tc, nil) {
 		return
 	}
@@ -2392,9 +2371,10 @@ func parseSetOption(parts []string) (name, value string) {
 */
 
 func uciLoop() {
-	pos := NewPosition()
+	pos, scratch := NewPosition(), new(Position) // position commands set up scratch, then swap
+	searcher := new(Searcher)
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Fprintln(os.Stderr, "# Soomi V1.2.0B ready. Type 'help' for available commands.")
+	fmt.Fprintf(os.Stderr, "# %s ready. Type 'help' for available commands.\n", EngineName)
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -2406,7 +2386,7 @@ func uciLoop() {
 
 		switch cmd {
 		case "uci":
-			fmt.Println("id name Soomi V1.2.0B")
+			fmt.Println("id name", EngineName)
 			fmt.Println("id author Otto Laukkanen")
 			fmt.Println("option name Hash type spin default 256 min 1 max 4096")
 			fmt.Println("uciok")
@@ -2432,49 +2412,17 @@ func uciLoop() {
 		case "ucinewgame":
 			stopSearch()
 			tt.Clear()
-			clearHeuristics()
+			searcher.clearHeuristics()
 			pos.setStartPos()
 
 		case "position":
 			stopSearch()
-			if len(parts) < 2 {
-				fmt.Println("# Error: position requires arguments")
+			if err := scratch.setPosition(parts[1:]); err != nil {
+				fmt.Printf("# Error: %v. Position unchanged.\n", err)
 				continue
 			}
-			movesAt := len(parts)
-			for i := 2; i < len(parts); i++ {
-				if parts[i] == "moves" {
-					movesAt = i
-					break
-				}
-			}
-			switch parts[1] {
-			case "startpos":
-				pos.setStartPos()
-			case "fen":
-				pos.setFEN(strings.Join(parts[2:movesAt], " "))
-			}
-			for _, mvStr := range parts[min(movesAt+1, len(parts)):] {
-				if len(mvStr) < 4 || len(mvStr) > 5 {
-					fmt.Printf("# Error: invalid move format: %s. Further moves ignored.\n", mvStr)
-					break
-				}
-				found := false
-				var buf [256]Move
-				n := pos.generateMovesTo(buf[:], false)
-				for j := 0; j < n; j++ {
-					m := buf[j]
-					if strings.EqualFold(m.String(), mvStr) && pos.isLegal(m) {
-						pos.makeMove(m)
-						found = true
-						break
-					}
-				}
-				if !found {
-					fmt.Printf("# Error: illegal move: %s. Further moves ignored.\n", mvStr)
-					break
-				}
-			}
+			pos, scratch = scratch, pos
+
 		case "go":
 			stopSearch()
 			tc := &TimeControl{}
@@ -2509,11 +2457,11 @@ func uciLoop() {
 			}
 
 			tc.allocateTime(pos.side)
-			pcopy := *pos
+			searcher.pos = *pos
 			currentTC.Store(tc)
 
 			searchWG.Add(1)
-			go runSearchAndReport(&pcopy, tc)
+			go runSearchAndReport(searcher, tc)
 
 		case "stop":
 			if cur := currentTC.Load(); cur != nil {
@@ -2547,7 +2495,7 @@ func uciLoop() {
 
 		case "eval":
 			score := pos.evaluate()
-			fmt.Printf("Evaluation: %+d (from %s's perspective)\n", score, [2]string{"White", "Black"}[pos.side])
+			fmt.Printf("Evaluation: %+d (from %s's perspective, net %08X)\n", score, [2]string{"White", "Black"}[pos.side], nnCRC)
 
 		case "audit":
 			fmt.Println("# Starting internal state audit...")
@@ -2573,13 +2521,9 @@ func uciLoop() {
 			if pos.epSquare != -1 {
 				expectedHash ^= zobristEP[pos.epSquare%8]
 			}
-			expectedPawnHash := uint64(0)
 			for sq, v := range pos.square {
 				if v >= 0 {
 					expectedHash ^= zobristPiece[v>>3][v&7][sq]
-					if v&7 == Pawn {
-						expectedPawnHash ^= zobristPiece[v>>3][Pawn][sq]
-					}
 				}
 			}
 			if expectedHash != pos.hash {
@@ -2587,10 +2531,16 @@ func uciLoop() {
 			} else {
 				fmt.Println("  - Zobrist hash: OK")
 			}
-			if expectedPawnHash != pos.pawnHash {
-				fmt.Printf("!! PAWN HASH DESYNC: pos.pawnHash (%x) != calculated (%x)\n", pos.pawnHash, expectedPawnHash)
+
+			// 3. NNUE accumulator: the incremental sums must equal a rebuild
+			pos.nnBuild()
+			var fresh [2][nnHidden]int16
+			pos.nnRefresh(&fresh, White)
+			pos.nnRefresh(&fresh, Black)
+			if fresh != pos.acc[pos.historyPly] {
+				fmt.Println("!! NNUE ACCUMULATOR DESYNC")
 			} else {
-				fmt.Println("  - Pawn hash: OK")
+				fmt.Println("  - NNUE accumulator: OK")
 			}
 			fmt.Println("# Audit complete.")
 
@@ -2637,14 +2587,15 @@ func uciLoop() {
 }
 
 func printHelp() {
-	fmt.Println(`# Soomi V1.2.0B - Available Commands:
-
+	fmt.Printf("# %s - Available Commands:\n", EngineName)
+	fmt.Println(`
 UCI Protocol Commands:
   uci                              - Initialize UCI mode
   isready                          - Check if engine is ready
   ucinewgame                       - Start a new game
   position startpos                - Set starting position
   position startpos moves <moves>  - Set position after moves
+  position fen <fen> [moves ...]   - Set position from a FEN
   go [options]                     - Start searching
       wtime <ms>                   - White's remaining time
       btime <ms>                   - Black's remaining time
@@ -2683,10 +2634,14 @@ Example Usage:
 }
 
 func main() {
-	fmt.Fprintln(os.Stderr, "Soomi V1.2.0B - UCI Chess Engine")
+	if err := loadNet(netData); err != nil {
+		fmt.Fprintln(os.Stderr, "soomi.nnue:", err)
+		os.Exit(1)
+	}
+	fmt.Fprintln(os.Stderr, EngineName, "- UCI Chess Engine")
 	fmt.Fprintln(os.Stderr, "Type 'help' for available commands or 'uci' to enter UCI mode")
 	uciLoop()
 }
 
 // To make an executable
-// set GOAMD64=v3 && go build -trimpath -ldflags "-s -w" -gcflags "all=-B" -o Soomi-V1.2.0B.exe Soomi.go
+// set "GOEXPERIMENT=simd" && set GOAMD64=v3 && go build -trimpath -ldflags "-s -w" -gcflags "all=-B" -o Soomi.exe Soomi.go
