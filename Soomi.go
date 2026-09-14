@@ -292,7 +292,7 @@ type SearchStack struct {
 // transposition table is shared.
 type Searcher struct {
 	pos          Position
-	out          *uciWriter // info lines go here
+	out          *UCIWriter // info lines go here
 	tc           *TimeControl
 	ss           [MaxDepth + 1]SearchStack
 	history      [2][64][64]int
@@ -735,7 +735,7 @@ func (p *Position) setStartPos() {
 // setFEN sets up the position from a FEN: piece placement, side to move, castling
 // rights and en passant square, then the two optional clocks. It rejects positions
 // the move generator cannot handle. On error p is left half-built, so set up a
-// scratch Position when the current one must survive (uciLoop does).
+// scratch Position when the current one must survive (the UCI position command does).
 func (p *Position) setFEN(fen string) error {
 	parts := strings.Fields(fen)
 	if len(parts) < 4 || len(parts) > 6 {
@@ -810,10 +810,7 @@ func (p *Position) parseBoard(board string) error {
 			}
 			color, pt, sq := i/6, i%6, (7-r)*8+file
 			file++
-			bb := sqBB[sq]
-			p.pieces[color][pt] |= bb
-			p.occupied[color] |= bb
-			p.all |= bb
+			p.toggle(color, pt, sqBB[sq])
 			p.square[sq] = (color << 3) | pt
 			p.hash ^= zobristPiece[color][pt][sq]
 		}
@@ -894,24 +891,28 @@ func (p *Position) setPosition(args []string) error {
 		return fmt.Errorf("expected startpos or fen <fen>")
 	}
 
-	var buf [256]Move
 	for _, s := range args[min(movesAt+1, len(args)):] {
-		n, found := p.generateMovesTo(buf[:], false), false
-		for _, m := range buf[:n] {
-			if strings.EqualFold(m.String(), s) && p.isLegal(m) {
-				p.makeMove(m)
-				found = true
-				break
-			}
-		}
+		m, found := p.findMove(s)
 		if !found {
 			return fmt.Errorf("illegal move %s", s)
 		}
+		p.makeMove(m)
 		if p.historyPly > MaxGamePly-1-MaxDepth {
 			p.rebaseHistory()
 		}
 	}
 	return nil
+}
+
+// findMove returns the legal move written as s in UCI notation (e2e4, e7e8q).
+func (p *Position) findMove(s string) (Move, bool) {
+	var buf [256]Move
+	for _, m := range buf[:p.generateMovesTo(buf[:], false)] {
+		if strings.EqualFold(m.String(), s) && p.isLegal(m) {
+			return m, true
+		}
+	}
+	return 0, false
 }
 
 // rebaseHistory moves the end of the game history to the front of the history
@@ -1092,6 +1093,14 @@ func (p *Position) isLegal(m Move) bool {
 	return !(pawnAttacks[them^1][kingSq]&(p.pieces[them][Pawn]&^capBB) != 0 || knightAttacks[kingSq]&(p.pieces[them][Knight]&^capBB) != 0 || bishopAttacks(kingSq, occ2)&((p.pieces[them][Bishop]|p.pieces[them][Queen])&^capBB) != 0 || rookAttacks(kingSq, occ2)&((p.pieces[them][Rook]|p.pieces[them][Queen])&^capBB) != 0 || kingAttacks[kingSq]&p.pieces[them][King] != 0)
 }
 
+// toggle flips the squares in bb for a colour-c piece pt in the piece, colour and
+// occupancy bitboards: pieces that are not there are added, pieces that are, removed.
+func (p *Position) toggle(c, pt int, bb Bitboard) {
+	p.pieces[c][pt] ^= bb
+	p.occupied[c] ^= bb
+	p.all ^= bb
+}
+
 func (p *Position) makeMove(m Move) Undo {
 	undo := Undo{
 		castle:           p.castle,
@@ -1122,10 +1131,7 @@ func (p *Position) makeMove(m Move) Undo {
 		capturedPiece := p.square[capSq] & 7
 		undo.captured = capturedPiece
 
-		bb := sqBB[capSq]
-		p.pieces[them][capturedPiece] &^= bb
-		p.occupied[them] &^= bb
-		p.all &^= bb
+		p.toggle(them, capturedPiece, sqBB[capSq])
 		h ^= zobristPiece[them][capturedPiece][capSq]
 		p.phase += piecePhase[capturedPiece]
 		d.removed(them, capturedPiece, capSq)
@@ -1133,10 +1139,7 @@ func (p *Position) makeMove(m Move) Undo {
 	}
 
 	if flags == FlagCastle {
-		kingBB := sqBB[from] | sqBB[to]
-		p.pieces[us][King] ^= kingBB
-		p.occupied[us] ^= kingBB
-		p.all ^= kingBB
+		p.toggle(us, King, sqBB[from]|sqBB[to])
 		h ^= zobristPiece[us][King][from] ^ zobristPiece[us][King][to]
 		p.square[from] = -1
 		p.square[to] = (us << 3) | King
@@ -1147,10 +1150,7 @@ func (p *Position) makeMove(m Move) Undo {
 		if to < from {
 			rf, rt = from-4, from-1
 		}
-		rookBB := sqBB[rf] | sqBB[rt]
-		p.pieces[us][Rook] ^= rookBB
-		p.occupied[us] ^= rookBB
-		p.all ^= rookBB
+		p.toggle(us, Rook, sqBB[rf]|sqBB[rt])
 		h ^= zobristPiece[us][Rook][rf] ^ zobristPiece[us][Rook][rt]
 		d.added(us, Rook, rt)
 		d.removed(us, Rook, rf)
@@ -1159,11 +1159,8 @@ func (p *Position) makeMove(m Move) Undo {
 
 	} else if flags >= FlagPromoN {
 		promoType := (flags & 3) + Knight
-		moveBB := sqBB[from] | sqBB[to]
-		p.pieces[us][Pawn] ^= sqBB[from]
-		p.pieces[us][promoType] ^= sqBB[to]
-		p.occupied[us] ^= moveBB
-		p.all ^= moveBB
+		p.toggle(us, Pawn, sqBB[from])
+		p.toggle(us, promoType, sqBB[to])
 		h ^= zobristPiece[us][Pawn][from] ^ zobristPiece[us][promoType][to]
 		p.phase -= piecePhase[promoType]
 		d.removed(us, Pawn, from)
@@ -1172,10 +1169,7 @@ func (p *Position) makeMove(m Move) Undo {
 		p.square[to] = (us << 3) | promoType
 
 	} else {
-		moveBB := sqBB[from] | sqBB[to]
-		p.pieces[us][movingPiece] ^= moveBB
-		p.occupied[us] ^= moveBB
-		p.all ^= moveBB
+		p.toggle(us, movingPiece, sqBB[from]|sqBB[to])
 		h ^= zobristPiece[us][movingPiece][from] ^ zobristPiece[us][movingPiece][to]
 		p.square[from] = -1
 		p.square[to] = (us << 3) | movingPiece
@@ -1224,10 +1218,7 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 	p.halfmove = undo.halfmove
 
 	if flags == FlagCastle {
-		kingBB := sqBB[from] | sqBB[to]
-		p.pieces[us][King] ^= kingBB
-		p.occupied[us] ^= kingBB
-		p.all ^= kingBB
+		p.toggle(us, King, sqBB[from]|sqBB[to])
 		p.square[to] = -1
 		p.square[from] = (us << 3) | King
 		p.kingSq[us] = from
@@ -1237,30 +1228,21 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 			rf, rt = from-1, from-4
 		}
 
-		rookBB := sqBB[rf] | sqBB[rt]
-		p.pieces[us][Rook] ^= rookBB
-		p.occupied[us] ^= rookBB
-		p.all ^= rookBB
+		p.toggle(us, Rook, sqBB[rf]|sqBB[rt])
 		p.square[rf] = -1
 		p.square[rt] = (us << 3) | Rook
 
 	} else if flags >= FlagPromoN {
 		promoType := (flags & 3) + Knight
-		moveBB := sqBB[from] | sqBB[to]
-		p.pieces[us][promoType] ^= sqBB[to]
-		p.pieces[us][Pawn] ^= sqBB[from]
-		p.occupied[us] ^= moveBB
-		p.all ^= moveBB
+		p.toggle(us, promoType, sqBB[to])
+		p.toggle(us, Pawn, sqBB[from])
 		p.phase += piecePhase[promoType]
 		p.square[to] = -1
 		p.square[from] = (us << 3) | Pawn
 
 	} else {
 		movingPt := p.square[to] & 7
-		moveBB := sqBB[from] | sqBB[to]
-		p.pieces[us][movingPt] ^= moveBB
-		p.occupied[us] ^= moveBB
-		p.all ^= moveBB
+		p.toggle(us, movingPt, sqBB[from]|sqBB[to])
 		p.square[to] = -1
 		p.square[from] = (us << 3) | movingPt
 		if movingPt == King {
@@ -1273,11 +1255,8 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 		if flags == FlagEP {
 			capSq ^= 8
 		}
-		bb := sqBB[capSq]
 		capturedPiece := undo.captured
-		p.pieces[them][capturedPiece] |= bb
-		p.occupied[them] |= bb
-		p.all |= bb
+		p.toggle(them, capturedPiece, sqBB[capSq])
 		p.square[capSq] = (them << 3) | capturedPiece
 		p.phase -= piecePhase[capturedPiece]
 	}
@@ -1466,6 +1445,10 @@ func nnFeature(view, c, pt, sq, kingSq int) int {
 // identical results.
 var nnSIMD = archsimd.X86.AVX2()
 
+// nnAddCol adds feature f's weight column to a. nnAddCol, nnSubCol and nnAddSubCol
+// are the accumulator kernels and stay three specialised loops on purpose: they run
+// on nearly every node, and one generic loop over lists of added and removed features
+// measured about 5% slower search (experiments.txt #26).
 func nnAddCol(a *[NNHidden]int16, f int) {
 	w := nnFtW[f*NNHidden : f*NNHidden+NNHidden]
 	if nnSIMD {
@@ -1479,6 +1462,7 @@ func nnAddCol(a *[NNHidden]int16, f int) {
 	}
 }
 
+// nnSubCol subtracts feature f's weight column from a.
 func nnSubCol(a *[NNHidden]int16, f int) {
 	w := nnFtW[f*NNHidden : f*NNHidden+NNHidden]
 	if nnSIMD {
@@ -2336,19 +2320,18 @@ func (p *Position) perft(depth int) int {
 	return count
 }
 
-func (p *Position) perftDivide(depth int, out *uciWriter) {
-	var moves [256]Move
-	total := 0
-	for _, m := range moves[:p.generateMovesTo(moves[:], false)] {
+// perftDivide returns every legal move with the perft count below it, which points
+// to the branch where a move generator bug hides.
+func (p *Position) perftDivide(depth int) (moves []Move, counts []int) {
+	var buf [256]Move
+	for _, m := range buf[:p.generateMovesTo(buf[:], false)] {
 		if p.isLegal(m) {
 			undo := p.makeMove(m)
-			count := p.perft(depth - 1)
+			moves, counts = append(moves, m), append(counts, p.perft(depth-1))
 			p.unmakeMove(m, undo)
-			out.printf("%v: %d\n", m, count)
-			total += count
 		}
 	}
-	out.printf("\nTotal: %d\n", total)
+	return moves, counts
 }
 
 /*
@@ -2368,24 +2351,24 @@ func (p *Position) perftDivide(depth int, out *uciWriter) {
    changes nothing.
 */
 
-// uciWriter serialises everything the engine prints: the UCI loop and the search
+// UCIWriter serialises everything the engine prints: the UCI loop and the search
 // goroutine both write, and every line has to reach the GUI whole.
-type uciWriter struct {
+type UCIWriter struct {
 	mu sync.Mutex
 	w  io.Writer
 }
 
-func (u *uciWriter) printf(format string, a ...any) {
+func (u *UCIWriter) printf(format string, a ...any) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	fmt.Fprintf(u.w, format, a...)
 }
 
-// uci is one UCI session: the GUI's position, the searcher that thinks about it and
+// UCI is one UCI session: the GUI's position, the searcher that thinks about it and
 // the search running in the background, if any. Only the loop goroutine uses it,
 // apart from the search goroutine's own searcher and output.
-type uci struct {
-	out          *uciWriter
+type UCI struct {
+	out          *UCIWriter
 	pos          *Position
 	scratch      *Position // position commands are set up here, then swapped in
 	searcher     *Searcher
@@ -2395,8 +2378,8 @@ type uci struct {
 }
 
 func uciLoop(in io.Reader, out io.Writer) {
-	u := &uci{
-		out:          &uciWriter{w: out},
+	u := &UCI{
+		out:          &UCIWriter{w: out},
 		pos:          newPosition(),
 		scratch:      new(Position),
 		searcher:     new(Searcher),
@@ -2413,7 +2396,7 @@ func uciLoop(in io.Reader, out io.Writer) {
 }
 
 // handle runs one command and reports whether to keep reading.
-func (u *uci) handle(parts []string) bool {
+func (u *UCI) handle(parts []string) bool {
 	switch parts[0] {
 	case "uci":
 		u.out.printf("id name %s\nid author Otto Laukkanen\n", EngineName)
@@ -2460,7 +2443,7 @@ func (u *uci) handle(parts []string) bool {
 	return true
 }
 
-func (u *uci) setOption(parts []string) {
+func (u *UCI) setOption(parts []string) {
 	name, value := parseSetOption(parts)
 	switch {
 	case strings.EqualFold(name, "Hash"):
@@ -2549,7 +2532,7 @@ func parseGo(args []string) (*TimeControl, error) {
 }
 
 // goSearch starts searching the current position in the background.
-func (u *uci) goSearch(args []string) {
+func (u *UCI) goSearch(args []string) {
 	u.stopSearch()
 	tc, err := parseGo(args)
 	if err != nil {
@@ -2564,7 +2547,7 @@ func (u *uci) goSearch(args []string) {
 
 // runSearch searches and reports the best move. After go infinite the protocol
 // allows the report only after stop, even when the search has reached MaxDepth.
-func (u *uci) runSearch(tc *TimeControl) {
+func (u *UCI) runSearch(tc *TimeControl) {
 	defer u.searchWG.Done()
 	move := u.searcher.search(tc)
 	for tc.infinite && atomic.LoadInt32(&tc.stopped) == 0 {
@@ -2574,7 +2557,7 @@ func (u *uci) runSearch(tc *TimeControl) {
 }
 
 // stopSearch halts the latest search and waits until it has printed its bestmove.
-func (u *uci) stopSearch() {
+func (u *UCI) stopSearch() {
 	if u.current != nil {
 		u.current.stop()
 		u.searchWG.Wait()
@@ -2582,7 +2565,7 @@ func (u *uci) stopSearch() {
 	}
 }
 
-func (u *uci) display() {
+func (u *UCI) display() {
 	var b strings.Builder
 	b.WriteString("\n   a b c d e f g h\n  ----------------\n")
 	for r := 7; r >= 0; r-- {
@@ -2603,7 +2586,7 @@ func (u *uci) display() {
 
 // audit checks the incrementally updated state of the current position against a
 // rebuild from its squares: occupancy, Zobrist hash and NNUE accumulator.
-func (u *uci) audit() {
+func (u *UCI) audit() {
 	p := u.pos
 	report := func(ok bool, what, desync string) {
 		if ok {
@@ -2647,7 +2630,7 @@ func (u *uci) audit() {
 
 // perft runs "perft <depth>" (node count and speed for each depth up to depth) or
 // "divide <depth>" (node count per root move).
-func (u *uci) perft(parts []string) {
+func (u *UCI) perft(parts []string) {
 	depth := 0
 	if len(parts) == 2 {
 		depth, _ = strconv.Atoi(parts[1])
@@ -2657,7 +2640,13 @@ func (u *uci) perft(parts []string) {
 		return
 	}
 	if parts[0] == "divide" {
-		u.pos.perftDivide(depth, u.out)
+		moves, counts := u.pos.perftDivide(depth)
+		total := 0
+		for i, m := range moves {
+			u.out.printf("%v: %d\n", m, counts[i])
+			total += counts[i]
+		}
+		u.out.printf("\nTotal: %d\n", total)
 		return
 	}
 	u.out.printf("\nRunning perft test...\nDepth    Nodes           Time        NPS\n---------------------------------------------\n")
