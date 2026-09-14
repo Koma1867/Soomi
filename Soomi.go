@@ -229,7 +229,7 @@ var bishopMagicNumbers = [64]uint64{
      (Unused)       Flag (4b)       To Sq (6b)      From Sq (6b)
                        ^                 ^                ^
                        |                 |                |
-   Example:           0100 (Capture)    111000 (H8)      000000 (A1)
+   Example:           0100 (Capture)    111000 (A8)      000000 (A1)
 
    - Mask 0x3F (63) extracts squares (0-63).
    - Shift >> 6 moves the 'To' bits to the bottom.
@@ -1598,8 +1598,7 @@ func (p *Position) evaluate() int {
    3. Good Captures   --> Captures that do not lose material, by SEE and MVV-LVA
    4. Killer Moves    --> Quiet moves that caused a cutoff at the same ply
    5. Countermoves    --> The quiet move that last refuted the opponent's previous move
-   6. History/PST     --> Other quiet moves, by history plus a PST delta
-   7. Losing Captures --> Negative SEE, after the quiet moves
+   6. Quiets and losing captures --> quiets by history plus a PST delta; a losing capture scores its negative SEE, so it sorts among the quiets with poor history.
 */
 
 func (s *Searcher) clearHeuristics() {
@@ -1646,7 +1645,7 @@ func (p *Position) orderMovesQ(moves []Move, scores []int) {
 }
 
 // scoreNoisy ranks promotions by piece, then SEE-safe captures by SEE and
-// MVV-LVA. Losing captures keep their negative SEE so they sort last.
+// MVV-LVA. Losing captures keep their negative SEE, which sorts them among the quiets with poor history.
 func (p *Position) scoreNoisy(m Move) int {
 	if m.isPromo() {
 		return ScorePromoBase + pieceValues[m.promoType()]
@@ -1952,6 +1951,7 @@ func (s *Searcher) pruneNode(depth, beta, ply int, prevMove Move) (int, bool) {
 		}
 	}
 	if probBeta := beta + ProbCutMargin; depth >= ProbCutDepthMin && probBeta <= Mate-MateScoreGuard {
+    // ply+1 looks like a bug, but fixing it lost about 15 Elo (SPRT #13), so it stays.
 		if score := s.negamax(depth-ProbCutReduction, probBeta-1, probBeta, ply+1, false, prevMove); score >= probBeta {
 			return score, true // soft fail
 		}
@@ -2722,4 +2722,5 @@ func main() {
 }
 
 // To make an executable
+// GOAMD64=v3 needs AVX2 (Intel Haswell / AMD Zen or newer); leave it out for a build that must run on any x86-64 CPU.
 // set "GOEXPERIMENT=simd" && set GOAMD64=v3 && go build -trimpath -ldflags "-s -w" -gcflags "all=-B" -o Soomi.exe Soomi.go
