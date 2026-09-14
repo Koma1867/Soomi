@@ -6,7 +6,7 @@
 
 <h1 align="center">Soomi Chess Engine</h1>
 
-Soomi is a UCI chess engine written in Go, in a single file plus its neural network (`soomi.nnue`), which is embedded into the executable.
+Soomi is a UCI chess engine written in Go, in a single file plus its neural network (`soomi.nnue`), which is embedded into the executable. From version 1.2.0B forward written with Claude code.
 
 ## Features
 - Magic bitboards
