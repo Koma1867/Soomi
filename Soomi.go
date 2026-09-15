@@ -67,7 +67,7 @@ const (
 // Search parameters: every depth limit, margin and reduction the search uses.
 const (
 	AspirationStartDepth = 4
-	AspirationBase       = 50   // first window half-width, doubled after each fail
+	AspirationBase       = 20   // first window half-width, doubled after each fail
 	AspirationMaxWindow  = 1000 // once the window reaches this, search the full window
 	IIRDepthMin          = 4    // reduce by 1 ply without a hash move at depth >= this
 	RFPDepthMax          = 8
@@ -1951,7 +1951,7 @@ func (s *Searcher) pruneNode(depth, beta, ply int, prevMove Move) (int, bool) {
 		}
 	}
 	if probBeta := beta + ProbCutMargin; depth >= ProbCutDepthMin && probBeta <= Mate-MateScoreGuard {
-    // ply+1 looks like a bug, but fixing it lost about 15 Elo (SPRT #13), so it stays.
+		// ply+1 looks like a bug, but fixing it lost about 15 Elo (SPRT #13), so it stays.
 		if score := s.negamax(depth-ProbCutReduction, probBeta-1, probBeta, ply+1, false, prevMove); score >= probBeta {
 			return score, true // soft fail
 		}
