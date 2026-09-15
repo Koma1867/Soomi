@@ -99,8 +99,8 @@ const (
 )
 
 // Move ordering scores, highest first: hash move, promotions, captures that do not lose
-// material, the two killers, then quiet moves by history, where the countermove gets
-// ScoreCountermove on top. Losing captures score their negative SEE. MVVLVAWeight makes
+// material, the two killers, then quiet moves by history plus a PST delta, with
+// ScoreCountermove on top for the countermove. Losing captures score their negative SEE. MVVLVAWeight makes
 // the captured piece's value count far more than the capturing piece's.
 const (
 	ScoreHash        = 1000000
@@ -194,13 +194,13 @@ var (
 // MagicEntry locates one square's slider attacks in its attack table.
 type MagicEntry struct {
 	mask   Bitboard // squares whose occupancy can change the attacks (relevantMask)
-	magic  Bitboard // multiplier that sends every masked occupancy to its own index
+	magic  Bitboard // multiplier that maps each masked occupancy to an index holding its attacks
 	shift  uint8    // 64 minus the mask's bit count
 	offset uint32   // where this square's part of the attack table starts
 }
 
-// Magic multipliers per square, known to give collision-free indices for these
-// table sizes.
+// Magic multipliers per square, known to map every occupancy to its correct attacks
+// within these table sizes.
 var rookMagicNumbers = [64]uint64{
 	0x0080001020400080, 0x0040001000200040, 0x0080081000200080, 0x0080040800100080,
 	0x0080020400080080, 0x0080010200040080, 0x0080008001000200, 0x0080002040800100,
@@ -276,7 +276,7 @@ type Position struct {
 	acc              [MaxGamePly][2][NNHidden]int16 // NNUE accumulators, indexed like historyKeys
 	nn               [MaxGamePly]NNPly              // each ply's accumulator change, applied lazily
 	historyPly       int                            // index of this position in historyKeys
-	lastIrreversible int                            // ply of the last capture or pawn move; repetitions start after it
+	lastIrreversible int                            // ply of the last capture or pawn move; repetition checks start there
 	kingSq           [2]int                         // king square per colour
 	phase            int                            // see computePhase
 }
@@ -344,7 +344,8 @@ func (p *Position) computePhase() {
 }
 
 // isEndgame reports whether at most 5 of the 24 phase units are left, rook and knight
-// against rook for example. pruneNode and quiesce then skip their pruning.
+// against rook for example. pruneNode then skips all its pruning, quiesce its delta
+// pruning.
 func (p *Position) isEndgame() bool {
 	return p.phase > EndgamePhase
 }
