@@ -41,12 +41,6 @@ Linux:
 GOEXPERIMENT=simd go build -trimpath -ldflags "-s -w" -gcflags "all=-B" -o soomi Soomi.go
 ```
 
-## Tests
-`commands\run_tests.bat` runs perft, the fixed-depth bench signature, FEN validation, long games and search edge cases. Elsewhere, with `GOEXPERIMENT=simd` set:
-```bash
-go test Soomi.go soomi_test.go
-```
-
 ## IMPORTANT
 From version 1.2.0B forwards built with Claude Code, do not test further, focus on human engines! Im updating github so i can have a backup for the files.
 
@@ -56,9 +50,6 @@ From version 1.2.0B forwards built with Claude Code, do not test further, focus 
 - Pondering, opening book
 - Larger networks, more training data
 - Better move ordering
-
-## Changes
-See `changelog.txt`.
 
 ## License
 Free to distribute and modify. Please credit the original author (Otto Laukkanen) if you use this code.
