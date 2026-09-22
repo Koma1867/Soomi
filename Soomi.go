@@ -59,6 +59,7 @@ const (
 const (
 	EngineName          = "Soomi V1.3.0"
 	MaxDepth            = 50    // deepest iteration and deepest ply; a node at this ply returns the static eval
+	MaxMoves            = 256   // room in every move list; a legal position has at most 218 legal moves
 	Infinity            = 30000 // beyond every score, for full windows
 	Mate                = 29000 // being mated at ply p scores -Mate + p
 	MateScoreGuard      = 1000  // scores within this of Mate are mate scores
@@ -160,7 +161,7 @@ var (
 	bishopMagics      [64]MagicEntry
 	rookAttackTable   [102400]Bitboard
 	bishopAttackTable [5248]Bitboard
-	lmrTable          [MaxDepth + 1][256]int // LMR reduction by [depth][move number] (initLMR)
+	lmrTable          [MaxDepth + 1][MaxMoves]int // LMR reduction by [depth][move number] (initLMR)
 	// The order SEE tries attackers in.
 	lvaOrder = [6]int{Pawn, Bishop, Knight, Rook, Queen, King}
 	// Castling rights kept by a move from or to each square (initCastleMask).
@@ -444,7 +445,10 @@ func (p *Position) isRepetition() bool {
 // isInsufficientMaterial reports positions with no pawns, rooks or queens and at most
 // one minor piece per side, which the search scores as draws.
 func (p *Position) isInsufficientMaterial() bool {
-	return (p.pieces[White][Pawn]|p.pieces[Black][Pawn]|p.pieces[White][Rook]|p.pieces[Black][Rook]|p.pieces[White][Queen]|p.pieces[Black][Queen]) == 0 && bits.OnesCount64(uint64(p.occupied[White])) <= 2 && bits.OnesCount64(uint64(p.occupied[Black])) <= 2
+	pawnsRooksQueens := p.pieces[White][Pawn] | p.pieces[Black][Pawn] | p.pieces[White][Rook] |
+		p.pieces[Black][Rook] | p.pieces[White][Queen] | p.pieces[Black][Queen]
+	return pawnsRooksQueens == 0 &&
+		bits.OnesCount64(uint64(p.occupied[White])) <= 2 && bits.OnesCount64(uint64(p.occupied[Black])) <= 2
 }
 
 // TTEntry is one table slot.
@@ -570,7 +574,7 @@ func initCastleMask() {
 // initLMR fills lmrTable with the formula beside LMRDivisor, rounded down.
 func initLMR() {
 	for d := 1; d <= MaxDepth; d++ {
-		for m := 1; m < 256; m++ {
+		for m := 1; m < MaxMoves; m++ {
 			val := LMRBase + math.Log(float64(d))*math.Log(float64(m))/LMRDivisor
 			lmrTable[d][m] = int(val)
 		}
@@ -963,7 +967,7 @@ func (p *Position) setPosition(args []string) error {
 
 // findMove returns the legal move written as s in UCI notation (e2e4, e7e8q).
 func (p *Position) findMove(s string) (Move, bool) {
-	var buf [256]Move
+	var buf [MaxMoves]Move
 	for _, m := range buf[:p.generateMovesTo(buf[:], false)] {
 		if strings.EqualFold(m.String(), s) && p.isLegal(m) {
 			return m, true
@@ -1033,7 +1037,7 @@ func (p *Position) inCheck() bool {
    }
 */
 
-// generateMovesTo writes the pseudo-legal moves into buf, which needs room for 256, and
+// generateMovesTo writes the pseudo-legal moves into buf, which needs room for MaxMoves, and
 // returns how many there are. Promotions come queen first. With capturesOnly it writes
 // only captures, en passant and capturing promotions, for the quiescence search.
 // Castling needs the right, no check and empty squares between king and rook; isLegal
@@ -1162,7 +1166,13 @@ func (p *Position) isLegal(m Move) bool {
 	if pt == King {
 		kingSq = to
 	}
-	return !(pawnAttacks[them^1][kingSq]&(p.pieces[them][Pawn]&^capBB) != 0 || knightAttacks[kingSq]&(p.pieces[them][Knight]&^capBB) != 0 || bishopAttacks(kingSq, occ2)&((p.pieces[them][Bishop]|p.pieces[them][Queen])&^capBB) != 0 || rookAttacks(kingSq, occ2)&((p.pieces[them][Rook]|p.pieces[them][Queen])&^capBB) != 0 || kingAttacks[kingSq]&p.pieces[them][King] != 0)
+	// No enemy piece may still attack the king; a captured piece attacks nothing
+	queens := p.pieces[them][Queen]
+	return pawnAttacks[us][kingSq]&p.pieces[them][Pawn]&^capBB == 0 &&
+		knightAttacks[kingSq]&p.pieces[them][Knight]&^capBB == 0 &&
+		bishopAttacks(kingSq, occ2)&(p.pieces[them][Bishop]|queens)&^capBB == 0 &&
+		rookAttacks(kingSq, occ2)&(p.pieces[them][Rook]|queens)&^capBB == 0 &&
+		kingAttacks[kingSq]&p.pieces[them][King] == 0
 }
 
 // toggle flips the squares in bb for a colour-c piece pt in the piece, colour and
@@ -1488,7 +1498,7 @@ func loadNet(b []byte) error {
 	}
 	if string(b[:4]) != "SNUE" || le.Uint16(b[4:]) != 1 || le.Uint16(b[6:]) != 1 || le.Uint16(b[8:]) != NNInputs ||
 		le.Uint16(b[10:]) != NNHidden || le.Uint16(b[12:]) != NNBuckets || le.Uint16(b[14:]) != NNQA || le.Uint16(b[16:]) != NNQB {
-		return fmt.Errorf("header does not match this engine (768 -> 128x2 -> 8 buckets, mirrored)")
+		return fmt.Errorf("header does not match this engine (%d -> %dx2 -> %d buckets, mirrored)", NNInputs, NNHidden, NNBuckets)
 	}
 	nnScale = int(le.Uint16(b[18:]))
 	i := 20
@@ -1697,7 +1707,7 @@ func (s *Searcher) clearHeuristics() {
 // move).
 func (s *Searcher) orderMoves(moves []Move, bestMove Move, killer1, killer2 Move, prevMove Move) []Move {
 	p := &s.pos
-	var stackScores [256]int
+	var stackScores [MaxMoves]int
 	scores := stackScores[:len(moves)]
 	for i, m := range moves {
 		switch {
@@ -1822,10 +1832,10 @@ func (s *Searcher) quiesce(alpha, beta, ply int) int {
 		}
 	}
 
-	var movesArr [256]Move
+	var movesArr [MaxMoves]Move
 	n := p.generateMovesTo(movesArr[:], !inCheck)
 	moves := movesArr[:n]
-	var stackScores [256]int
+	var stackScores [MaxMoves]int
 	scores := stackScores[:n]
 	p.orderMovesQ(moves, scores)
 
@@ -1950,14 +1960,14 @@ func (s *Searcher) negamax(depth, alpha, beta, ply int, pvNode bool, prevMove Mo
 		}
 	}
 
-	var movesArr [256]Move
+	var movesArr [MaxMoves]Move
 	n := p.generateMovesTo(movesArr[:], false)
 	moves := s.orderMoves(movesArr[:n], hashMove, s.ss[ply].killer1, s.ss[ply].killer2, prevMove)
 
 	bestMove := Move(0)
 	bestScore := -Infinity
 	legalMoves := 0
-	var quietsTried [256]Move // quiet moves searched here, for the history malus
+	var quietsTried [MaxMoves]Move // quiet moves searched here, for the history malus
 	quietCount := 0
 
 	for _, m := range moves {
@@ -2109,7 +2119,7 @@ func (s *Searcher) searchMove(m Move, depth, alpha, beta, ply, legalMoves int, p
 		if zeroWindow {
 			d := childDepth
 			if canReduce {
-				red := lmrTable[min(depth, MaxDepth)][min(legalMoves, 255)]
+				red := lmrTable[min(depth, MaxDepth)][min(legalMoves, MaxMoves-1)]
 				// Reduce more at non-PV nodes and for moves with a poor history
 				if !pvNode {
 					red++
@@ -2142,7 +2152,9 @@ func (s *Searcher) updateQuietStats(m Move, depth, ply int, prevMove Move, tried
 	for _, q := range tried {
 		s.updateHistory(side, q.from(), q.to(), -bonus)
 	}
-	s.countermoves[side][prevMove.from()][prevMove.to()] = m
+	if prevMove != 0 { // no previous move at the root and after a null move
+		s.countermoves[side][prevMove.from()][prevMove.to()] = m
+	}
 }
 
 /*
@@ -2444,7 +2456,7 @@ func (p *Position) perft(depth int) int {
 	if depth == 0 {
 		return 1
 	}
-	var moves [256]Move
+	var moves [MaxMoves]Move
 	count := 0
 	for _, m := range moves[:p.generateMovesTo(moves[:], false)] {
 		if p.isLegal(m) {
@@ -2459,7 +2471,7 @@ func (p *Position) perft(depth int) int {
 // perftDivide returns every legal move with the perft count below it, which points
 // to the branch where a move generator bug hides.
 func (p *Position) perftDivide(depth int) (moves []Move, counts []int) {
-	var buf [256]Move
+	var buf [MaxMoves]Move
 	for _, m := range buf[:p.generateMovesTo(buf[:], false)] {
 		if p.isLegal(m) {
 			undo := p.makeMove(m)
@@ -2513,8 +2525,13 @@ type UCI struct {
 	searchWG     sync.WaitGroup
 }
 
+// MaxInputLine is the longest command line uciLoop reads, in bytes: far more than a
+// "position ... moves" line for the longest possible game.
+const MaxInputLine = 1 << 20
+
 // uciLoop reads commands from in until quit or the end of the input, answers on out, and
-// stops any search still running before it returns.
+// stops any search still running before it returns. A read error, such as a line over
+// MaxInputLine bytes, is reported with info string.
 func uciLoop(in io.Reader, out io.Writer) {
 	u := &UCI{
 		out:          &UCIWriter{w: out},
@@ -2525,10 +2542,14 @@ func uciLoop(in io.Reader, out io.Writer) {
 	}
 	u.searcher.out = u.out
 	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 0, 64*1024), MaxInputLine)
 	for scanner.Scan() {
 		if parts := strings.Fields(scanner.Text()); len(parts) > 0 && !u.handle(parts) {
 			break
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		u.out.printf("info string error: reading input: %v\n", err)
 	}
 	u.stopSearch()
 }
