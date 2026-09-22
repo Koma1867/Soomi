@@ -67,8 +67,7 @@ const (
 	NodeCheckMaskSearch = 1023  // the search checks the clock every 1024 nodes
 	DefaultTTSizeMB     = 256
 	ZobristSeed         = 1070372 // fixed, so hash keys and bench node counts are the same every run
-	TotalPhase          = 24      // computePhase with no knights, bishops, rooks or queens left
-	EndgamePhase        = 18      // isEndgame: more phase than this is gone
+	EndgameMaterial     = 5       // isEndgame: at most this much non-pawn material left
 )
 
 // Search parameters: every depth limit, margin and reduction the search uses.
@@ -153,8 +152,7 @@ const (
 var (
 	// Centipawns for SEE, MVV-LVA and delta pruning; the king's value is a sentinel.
 	pieceValues       = [6]int{89, 313, 317, 504, 1001, 20000}
-	piecePhase        = [6]int{0, 1, 1, 2, 4, 0} // phase weight per piece type (computePhase)
-	tt                *TranspositionTable        // shared by every search (initTT)
+	tt                *TranspositionTable // shared by every search (initTT)
 	rookMagics        [64]MagicEntry
 	bishopMagics      [64]MagicEntry
 	rookAttackTable   [102400]Bitboard
@@ -276,8 +274,6 @@ type Position struct {
 	nn               [MaxGamePly]NNPly              // each ply's accumulator change, applied lazily
 	historyPly       int                            // index of this position in historyKeys
 	lastIrreversible int                            // ply of the last capture or pawn move; repetition checks start there
-	kingSq           [2]int                         // king square per colour
-	phase            int                            // see computePhase
 }
 
 // Undo holds what makeMove cannot work out again when the move is taken back. The
@@ -333,20 +329,15 @@ type Searcher struct {
 	start        time.Time // when this search started
 }
 
-// phase counts the non-pawn material that is gone (N=1, B=1, R=2, Q=4): 0 with
-// every piece on the board, TotalPhase (24) with none. Search uses it to spot endgames.
-func (p *Position) computePhase() {
-	p.phase = TotalPhase
-	for pt := Knight; pt <= Queen; pt++ {
-		p.phase -= bits.OnesCount64(uint64(p.pieces[White][pt]|p.pieces[Black][pt])) * piecePhase[pt]
-	}
-}
-
-// isEndgame reports whether at most 5 of the 24 phase units are left, rook and knight
+// isEndgame reports whether at most EndgameMaterial units of non-pawn material are
+// left, counting N and B as 1, R as 2 and Q as 4 (24 at the start): rook and knight
 // against rook for example. pruneNode then skips all its pruning, quiesce its delta
 // pruning.
 func (p *Position) isEndgame() bool {
-	return p.phase > EndgamePhase
+	minors := p.pieces[White][Knight] | p.pieces[Black][Knight] | p.pieces[White][Bishop] | p.pieces[Black][Bishop]
+	left := bits.OnesCount64(uint64(minors)) + 2*bits.OnesCount64(uint64(p.pieces[White][Rook]|p.pieces[Black][Rook])) +
+		4*bits.OnesCount64(uint64(p.pieces[White][Queen]|p.pieces[Black][Queen]))
+	return left <= EndgameMaterial
 }
 
 // Slider directions as (rank, file) steps.
@@ -408,14 +399,9 @@ func initMagics(entries *[64]MagicEntry, table []Bitboard, numbers *[64]uint64, 
 	}
 }
 
-// sqBB[sq] is the bitboard with only sq set.
-var sqBB [64]Bitboard
-
-func initSqBB() {
-	for i := 0; i < 64; i++ {
-		sqBB[i] = Bitboard(1) << uint(i)
-	}
-}
+// squareBB returns the bitboard with only sq set. The & 63 tells the compiler the
+// shift stays below 64, so it compiles to a single shift instruction.
+func squareBB(sq int) Bitboard { return 1 << (sq & 63) }
 
 var (
 	zobristPiece      [2][6][64]uint64 // Zobrist keys (initZobrist), [colour][piece][square]
@@ -550,7 +536,6 @@ func (t *TranspositionTable) hashfull() int {
 func init() {
 	initCastleMask()
 	initZobrist()
-	initSqBB()
 	initAttacks()
 	initMagicBitboards()
 	initLMR()
@@ -693,13 +678,13 @@ func initAttacks() {
 		for to := 0; to < 64; to++ {
 			dr, df := to>>3-r, to&7-f
 			if abs(dr*df) == 2 { // (1,2) or (2,1): a knight jump
-				knightAttacks[sq] |= sqBB[to]
+				knightAttacks[sq] |= squareBB(to)
 			}
 			if max(abs(dr), abs(df)) == 1 {
-				kingAttacks[sq] |= sqBB[to]
+				kingAttacks[sq] |= squareBB(to)
 			}
 			if abs(dr) == 1 && abs(df) == 1 { // pawns capture one rank forward: up for White (dr 1), down for Black
-				pawnAttacks[(1-dr)/2][sq] |= sqBB[to]
+				pawnAttacks[(1-dr)/2][sq] |= squareBB(to)
 			}
 		}
 	}
@@ -786,7 +771,7 @@ func (p *Position) setFEN(fen string) error {
 	default:
 		return fmt.Errorf("bad side to move %q", parts[1])
 	}
-	if p.isAttacked(p.kingSq[p.side^1], p.side, p.all) {
+	if p.isAttacked(p.kingSquare(p.side^1), p.side, p.all) {
 		return fmt.Errorf("the side not to move is in check")
 	}
 	if err := p.parseCastling(parts[2]); err != nil {
@@ -811,7 +796,6 @@ func (p *Position) setFEN(fen string) error {
 	}
 
 	p.historyKeys[0] = p.hash
-	p.computePhase()
 	p.nnRefresh(&p.acc[0], White)
 	p.nnRefresh(&p.acc[0], Black)
 	p.nn[0].ready = [2]bool{true, true}
@@ -838,7 +822,7 @@ func (p *Position) parseBoard(board string) error {
 			}
 			color, pt, sq := i/6, i%6, (7-r)*8+file
 			file++
-			p.toggle(color, pt, sqBB[sq])
+			p.toggle(color, pt, squareBB(sq))
 			p.square[sq] = (color << 3) | pt
 			p.hash ^= zobristPiece[color][pt][sq]
 		}
@@ -856,8 +840,6 @@ func (p *Position) parseBoard(board string) error {
 	if (p.pieces[White][Pawn]|p.pieces[Black][Pawn])&0xFF000000000000FF != 0 {
 		return fmt.Errorf("pawn on the first or last rank")
 	}
-	p.kingSq[White] = bits.TrailingZeros64(uint64(p.pieces[White][King]))
-	p.kingSq[Black] = bits.TrailingZeros64(uint64(p.pieces[Black][King]))
 	return nil
 }
 
@@ -982,10 +964,14 @@ func (p *Position) isAttacked(sq, bySide int, occ Bitboard) bool {
 		(rookAttacks(sq, occ)&(p.pieces[bySide][Rook]|qu) != 0)
 }
 
+// kingSquare returns colour c's king square, the only bit of its king bitboard.
+func (p *Position) kingSquare(c int) int {
+	return bits.TrailingZeros64(uint64(p.pieces[c][King]))
+}
+
 // inCheck reports whether the side to move's king is attacked.
 func (p *Position) inCheck() bool {
-	kingSq := p.kingSq[p.side]
-	return p.isAttacked(kingSq, p.side^1, p.all)
+	return p.isAttacked(p.kingSquare(p.side), p.side^1, p.all)
 }
 
 /*
@@ -1021,7 +1007,7 @@ func (p *Position) generateMovesTo(buf []Move, capturesOnly bool) int {
 		to := from + push
 
 		if from>>3 == promoRank {
-			if !capturesOnly && occAll&sqBB[to] == 0 {
+			if !capturesOnly && occAll&squareBB(to) == 0 {
 				for flag := FlagPromoQ; flag >= FlagPromoN; flag-- {
 					buf[i] = newMove(from, to, flag)
 					i++
@@ -1035,10 +1021,10 @@ func (p *Position) generateMovesTo(buf []Move, capturesOnly bool) int {
 				}
 			}
 		} else {
-			if !capturesOnly && occAll&sqBB[to] == 0 {
+			if !capturesOnly && occAll&squareBB(to) == 0 {
 				buf[i] = newMove(from, to, FlagQuiet)
 				i++
-				if from>>3 == dblRank && occAll&sqBB[from+2*push] == 0 {
+				if from>>3 == dblRank && occAll&squareBB(from+2*push) == 0 {
 					buf[i] = newMove(from, from+2*push, FlagQuiet)
 					i++
 				}
@@ -1047,7 +1033,7 @@ func (p *Position) generateMovesTo(buf []Move, capturesOnly bool) int {
 				buf[i] = newMove(from, popLSB(&att), FlagCapture)
 				i++
 			}
-			if ep >= 0 && pawnAttacks[us][from]&sqBB[ep] != 0 {
+			if ep >= 0 && pawnAttacks[us][from]&squareBB(ep) != 0 {
 				buf[i] = newMove(from, ep, FlagEP)
 				i++
 			}
@@ -1077,7 +1063,7 @@ func (p *Position) generateMovesTo(buf []Move, capturesOnly bool) int {
 			for attacks != 0 {
 				to := popLSB(&attacks)
 				flag := FlagQuiet
-				if occThem&sqBB[to] != 0 {
+				if occThem&squareBB(to) != 0 {
 					flag = FlagCapture
 				}
 				buf[i] = newMove(from, to, flag)
@@ -1117,7 +1103,7 @@ func (p *Position) isLegal(m Move) bool {
 		return !p.isAttacked(from+d, them, p.all) && !p.isAttacked(from+2*d, them, p.all)
 	}
 	pt := p.square[from] & 7
-	fromBB, toBB := sqBB[from], sqBB[to]
+	fromBB, toBB := squareBB(from), squareBB(to)
 
 	capBB := Bitboard(0)
 	if m.isCapture() {
@@ -1125,11 +1111,11 @@ func (p *Position) isLegal(m Move) bool {
 		if flags == FlagEP {
 			capSq ^= 8
 		}
-		capBB = sqBB[capSq]
+		capBB = squareBB(capSq)
 	}
 
 	occ2 := (p.all &^ fromBB &^ capBB) | toBB
-	kingSq := p.kingSq[us]
+	kingSq := p.kingSquare(us)
 	if pt == King {
 		kingSq = to
 	}
@@ -1183,26 +1169,24 @@ func (p *Position) makeMove(m Move) Undo {
 		capturedPiece := p.square[capSq] & 7
 		undo.captured = capturedPiece
 
-		p.toggle(them, capturedPiece, sqBB[capSq])
+		p.toggle(them, capturedPiece, squareBB(capSq))
 		h ^= zobristPiece[them][capturedPiece][capSq]
-		p.phase += piecePhase[capturedPiece]
 		d.removed(them, capturedPiece, capSq)
 		p.square[capSq] = -1
 	}
 
 	if flags == FlagCastle {
-		p.toggle(us, King, sqBB[from]|sqBB[to])
+		p.toggle(us, King, squareBB(from)|squareBB(to))
 		h ^= zobristPiece[us][King][from] ^ zobristPiece[us][King][to]
 		p.square[from] = -1
 		p.square[to] = (us << 3) | King
-		p.kingSq[us] = to
 		d.added(us, King, to)
 		d.removed(us, King, from)
 		rf, rt := from+3, from+1 // king side
 		if to < from {
 			rf, rt = from-4, from-1
 		}
-		p.toggle(us, Rook, sqBB[rf]|sqBB[rt])
+		p.toggle(us, Rook, squareBB(rf)|squareBB(rt))
 		h ^= zobristPiece[us][Rook][rf] ^ zobristPiece[us][Rook][rt]
 		d.added(us, Rook, rt)
 		d.removed(us, Rook, rf)
@@ -1211,23 +1195,19 @@ func (p *Position) makeMove(m Move) Undo {
 
 	} else if flags >= FlagPromoN {
 		promoType := (flags & 3) + Knight
-		p.toggle(us, Pawn, sqBB[from])
-		p.toggle(us, promoType, sqBB[to])
+		p.toggle(us, Pawn, squareBB(from))
+		p.toggle(us, promoType, squareBB(to))
 		h ^= zobristPiece[us][Pawn][from] ^ zobristPiece[us][promoType][to]
-		p.phase -= piecePhase[promoType]
 		d.removed(us, Pawn, from)
 		d.added(us, promoType, to)
 		p.square[from] = -1
 		p.square[to] = (us << 3) | promoType
 
 	} else {
-		p.toggle(us, movingPiece, sqBB[from]|sqBB[to])
+		p.toggle(us, movingPiece, squareBB(from)|squareBB(to))
 		h ^= zobristPiece[us][movingPiece][from] ^ zobristPiece[us][movingPiece][to]
 		p.square[from] = -1
 		p.square[to] = (us << 3) | movingPiece
-		if movingPiece == King {
-			p.kingSq[us] = to
-		}
 		d.added(us, movingPiece, to)
 		d.removed(us, movingPiece, from)
 
@@ -1238,7 +1218,7 @@ func (p *Position) makeMove(m Move) Undo {
 	}
 
 	p.castle &= castleMask[from] & castleMask[to]
-	d.kingSq, d.ready = [2]int8{int8(p.kingSq[White]), int8(p.kingSq[Black])}, [2]bool{}
+	d.kingSq, d.ready = [2]int8{int8(p.kingSquare(White)), int8(p.kingSquare(Black))}, [2]bool{}
 	// A king crossing files d/e flips its own view's mirroring: rebuild that view now,
 	// while the board is at this ply. The other view stays lazy.
 	if movingPiece == King && (from&7 < 4) != (to&7 < 4) {
@@ -1271,36 +1251,31 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 	p.halfmove = undo.halfmove
 
 	if flags == FlagCastle {
-		p.toggle(us, King, sqBB[from]|sqBB[to])
+		p.toggle(us, King, squareBB(from)|squareBB(to))
 		p.square[to] = -1
 		p.square[from] = (us << 3) | King
-		p.kingSq[us] = from
 
 		rf, rt := from+1, from+3 // king side
 		if to < from {
 			rf, rt = from-1, from-4
 		}
 
-		p.toggle(us, Rook, sqBB[rf]|sqBB[rt])
+		p.toggle(us, Rook, squareBB(rf)|squareBB(rt))
 		p.square[rf] = -1
 		p.square[rt] = (us << 3) | Rook
 
 	} else if flags >= FlagPromoN {
 		promoType := (flags & 3) + Knight
-		p.toggle(us, promoType, sqBB[to])
-		p.toggle(us, Pawn, sqBB[from])
-		p.phase += piecePhase[promoType]
+		p.toggle(us, promoType, squareBB(to))
+		p.toggle(us, Pawn, squareBB(from))
 		p.square[to] = -1
 		p.square[from] = (us << 3) | Pawn
 
 	} else {
 		movingPt := p.square[to] & 7
-		p.toggle(us, movingPt, sqBB[from]|sqBB[to])
+		p.toggle(us, movingPt, squareBB(from)|squareBB(to))
 		p.square[to] = -1
 		p.square[from] = (us << 3) | movingPt
-		if movingPt == King {
-			p.kingSq[us] = from
-		}
 	}
 
 	if undo.captured >= 0 {
@@ -1309,9 +1284,8 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 			capSq ^= 8
 		}
 		capturedPiece := undo.captured
-		p.toggle(them, capturedPiece, sqBB[capSq])
+		p.toggle(them, capturedPiece, squareBB(capSq))
 		p.square[capSq] = (them << 3) | capturedPiece
-		p.phase -= piecePhase[capturedPiece]
 	}
 	p.hash = p.historyKeys[p.historyPly]
 }
@@ -1332,7 +1306,7 @@ func (p *Position) makeNullMove() Undo {
 		p.epSquare = -1
 	}
 	p.halfmove++
-	p.nn[p.historyPly+1] = NNPly{kingSq: [2]int8{int8(p.kingSq[White]), int8(p.kingSq[Black])}} // nothing changed
+	p.nn[p.historyPly+1] = NNPly{kingSq: [2]int8{int8(p.kingSquare(White)), int8(p.kingSquare(Black))}} // nothing changed
 	p.historyPly++
 	p.historyKeys[p.historyPly] = p.hash
 	return undo
@@ -1363,12 +1337,12 @@ func (p *Position) see(m Move) int {
 	}
 	diagSliders := p.pieces[White][Bishop] | p.pieces[Black][Bishop] | p.pieces[White][Queen] | p.pieces[Black][Queen]
 	orthSliders := p.pieces[White][Rook] | p.pieces[Black][Rook] | p.pieces[White][Queen] | p.pieces[Black][Queen]
-	occ := p.all &^ sqBB[from]
+	occ := p.all &^ squareBB(from)
 	att := pawnAttacks[White][to]&p.pieces[Black][Pawn] | pawnAttacks[Black][to]&p.pieces[White][Pawn] |
 		knightAttacks[to]&(p.pieces[White][Knight]|p.pieces[Black][Knight]) |
 		kingAttacks[to]&(p.pieces[White][King]|p.pieces[Black][King])
 	// The moved piece leaves, which can uncover x-ray sliders behind it
-	att = att&^sqBB[from] | p.getXrayAttackers(to, occ, diagSliders, orthSliders)
+	att = att&^squareBB(from) | p.getXrayAttackers(to, occ, diagSliders, orthSliders)
 	us, d := p.side^1, 0
 	for {
 		myAtt := att & p.occupied[us]
@@ -1382,7 +1356,7 @@ func (p *Position) see(m Move) int {
 		d++
 		gain[d] = pieceValues[piece] - gain[d-1]
 		piece = lvaOrder[i]
-		bb := sqBB[bits.TrailingZeros64(uint64(myAtt&p.pieces[us][piece]))]
+		bb := squareBB(bits.TrailingZeros64(uint64(myAtt & p.pieces[us][piece])))
 		att &^= bb
 		occ &^= bb
 		att |= p.getXrayAttackers(to, occ, diagSliders, orthSliders)
@@ -1554,10 +1528,11 @@ func nnAddSubCol(dst, src *[NNHidden]int16, add, sub int) {
 // nnRefresh rebuilds view's half of acc from the board.
 func (p *Position) nnRefresh(acc *[2][NNHidden]int16, view int) {
 	acc[view] = nnFtB
+	kingSq := p.kingSquare(view)
 	for c := White; c <= Black; c++ {
 		for pt := Pawn; pt <= King; pt++ {
 			for bb := p.pieces[c][pt]; bb != 0; {
-				nnAddCol(&acc[view], nnFeature(view, c, pt, popLSB(&bb), p.kingSq[view]))
+				nnAddCol(&acc[view], nnFeature(view, c, pt, popLSB(&bb), kingSq))
 			}
 		}
 	}
