@@ -152,9 +152,7 @@ const (
 
 var (
 	// Centipawns for SEE, MVV-LVA and delta pruning; the king's value is a sentinel.
-	pieceValues = [6]int{89, 313, 317, 504, 1001, 20000}
-	// [colour][piece][square], for quiet-move ordering only (orderMoves).
-	pst               [2][6][64]int
+	pieceValues       = [6]int{89, 313, 317, 504, 1001, 20000}
 	piecePhase        = [6]int{0, 1, 1, 2, 4, 0} // phase weight per piece type (computePhase)
 	tt                *TranspositionTable        // shared by every search (initTT)
 	rookMagics        [64]MagicEntry
@@ -300,10 +298,10 @@ type TimeControl struct {
 	btime     int64
 	winc      int64 // ms increment per move
 	binc      int64
-	movestogo int
+	movestogo int64
 	movetime  int64     // search exactly this many ms
 	infinite  bool      // search until stop
-	depth     int       // search to this depth
+	depth     int64     // search to this depth
 	optimumMs int64     // soft limit: no new iteration after this (scaled in shouldContinue)
 	deadline  time.Time // hard limit: the search stops mid-iteration; zero means none
 	stopped   int32     // 1 once stop was called
@@ -551,7 +549,6 @@ func (t *TranspositionTable) hashfull() int {
 // init builds every lookup table and the default transposition table; main loads the net.
 func init() {
 	initCastleMask()
-	initPST()
 	initZobrist()
 	initSqBB()
 	initAttacks()
@@ -581,9 +578,10 @@ func initLMR() {
 	}
 }
 
-// pst is only used to order quiet moves that have no history yet (orderMoves).
-func initPST() {
-	pst[White][Pawn] = [64]int{
+// pst[piece][square] from White's side, only to order quiet moves that have no history
+// yet (orderMoves). Black reads it flipped top to bottom (square ^ 56), like nnFeature.
+var pst = [6][64]int{
+	{ // pawn
 		0, 0, 0, 0, 0, 0, 0, 0,
 		-14, 12, -3, -13, -9, 9, 16, -8,
 		2, 4, 2, -3, 3, 1, 10, 3,
@@ -592,9 +590,8 @@ func initPST() {
 		6, 6, 10, 39, 43, 6, 21, 10,
 		63, 28, 94, 173, 126, 8, 25, 14,
 		0, 0, 0, 0, 0, 0, 0, 0,
-	}
-
-	pst[White][Knight] = [64]int{
+	},
+	{ // knight
 		-11, 3, 1, 9, 12, 0, 3, -81,
 		7, 0, 8, 20, 24, 14, 7, 9,
 		-9, 13, 15, 24, 29, 19, 27, -1,
@@ -603,9 +600,8 @@ func initPST() {
 		20, 44, 33, 61, 56, 49, 32, 47,
 		-20, -12, 15, 68, 39, 46, -9, 52,
 		-165, -89, -9, -15, 40, -12, -36, -77,
-	}
-
-	pst[White][Bishop] = [64]int{
+	},
+	{ // bishop
 		-15, 12, 5, -18, 3, -6, -19, -9,
 		14, 28, 6, 10, 9, 12, 25, -22,
 		15, 14, 17, 13, 6, 14, 7, -2,
@@ -614,9 +610,8 @@ func initPST() {
 		-7, 14, 7, 37, 20, 51, 14, -16,
 		-14, -5, -10, -4, 15, -18, -44, -12,
 		-34, -22, -76, -20, -76, -39, -9, -12,
-	}
-
-	pst[White][Rook] = [64]int{
+	},
+	{ // rook
 		4, 7, 15, 12, 17, 11, -6, 0,
 		-19, -17, -28, -16, -8, -2, -2, -29,
 		-24, -6, -27, -17, -15, -18, -12, -19,
@@ -625,9 +620,8 @@ func initPST() {
 		-1, 50, 28, 31, 51, 34, 42, 6,
 		12, 0, 19, 18, 40, 32, 10, 28,
 		24, 42, 52, 11, 47, 51, 59, 45,
-	}
-
-	pst[White][Queen] = [64]int{
+	},
+	{ // queen
 		-10, 9, 9, 5, 15, -10, -5, -11,
 		2, 14, 7, 8, 7, 5, 25, 11,
 		-8, 3, -6, -5, -8, -4, -2, 6,
@@ -636,9 +630,8 @@ func initPST() {
 		-19, -6, -13, 5, -2, 47, 7, 1,
 		-46, -49, -4, -10, 3, 46, 0, 26,
 		-26, 29, 57, 32, 41, 6, 44, 26,
-	}
-
-	pst[White][King] = [64]int{
+	},
+	{ // king
 		18, 21, 18, -28, -5, -14, 5, 3,
 		43, 15, -7, -15, -12, -7, 12, -3,
 		-36, 10, -9, -6, -25, -15, -25, -26,
@@ -647,34 +640,17 @@ func initPST() {
 		-19, 61, 59, 33, -15, 47, -4, 6,
 		0, 132, 119, 25, 62, 104, 84, 52,
 		-102, 144, 79, 112, 140, 220, 130, -34,
-	}
-
-	// Black's tables are White's, flipped top to bottom
-	for pt := 0; pt < 6; pt++ {
-		for sq := 0; sq < 64; sq++ {
-			pst[Black][pt][sq] = pst[White][pt][sq^56]
-		}
-	}
+	},
 }
 
 /*
   ----------------------------------------------------------------------------------
-   ZOBRIST HASHING INITIALIZATION
+   ZOBRIST HASHING
   ----------------------------------------------------------------------------------
-   We assign a random 64-bit number to every possible board state component.
-
-   Components Hashed:
-   1. Piece at Square (e.g., White Pawn on E4)
-   2. Side to Move (White/Black)
-   3. Castling Rights (KQkq)
-   4. En Passant File
-
-   The final Board Hash is the XOR sum of all active components.
-   Hash = [WP_on_E4] ^ [BK_on_E8] ^ [WhiteToMove] ^ ...
-
-   Incremental Update:
-   When a piece moves, we don't recalculate from scratch. We XOR out the old
-   piece and XOR in the new one.
+   A position's hash is the XOR of one random 64-bit key per piece on its square, plus
+   keys for Black to move, each castling right and the en passant file. makeMove
+   updates it incrementally: a moving piece's key is XORed out of its old square and
+   into its new one.
 */
 
 // initZobrist fills the Zobrist keys from an xorshift generator with a fixed seed.
@@ -715,25 +691,16 @@ func initAttacks() {
 	for sq := 0; sq < 64; sq++ {
 		r, f := sq>>3, sq&7
 		for to := 0; to < 64; to++ {
-			dr, df := abs(to>>3-r), abs(to&7-f)
-			if dr*df == 2 { // (1,2) or (2,1): a knight jump
+			dr, df := to>>3-r, to&7-f
+			if abs(dr*df) == 2 { // (1,2) or (2,1): a knight jump
 				knightAttacks[sq] |= sqBB[to]
 			}
-			if max(dr, df) == 1 {
+			if max(abs(dr), abs(df)) == 1 {
 				kingAttacks[sq] |= sqBB[to]
 			}
-		}
-		if r < 7 && f > 0 {
-			pawnAttacks[White][sq] |= sqBB[sq+7]
-		}
-		if r < 7 && f < 7 {
-			pawnAttacks[White][sq] |= sqBB[sq+9]
-		}
-		if r > 0 && f > 0 {
-			pawnAttacks[Black][sq] |= sqBB[sq-9]
-		}
-		if r > 0 && f < 7 {
-			pawnAttacks[Black][sq] |= sqBB[sq-7]
+			if abs(dr) == 1 && abs(df) == 1 { // pawns capture one rank forward: up for White (dr 1), down for Black
+				pawnAttacks[(1-dr)/2][sq] |= sqBB[to]
+			}
 		}
 	}
 }
@@ -1720,10 +1687,10 @@ func (s *Searcher) orderMoves(moves []Move, bestMove Move, killer1, killer2 Move
 		case m == killer2:
 			scores[i] = ScoreKiller2
 		default:
-			from, to := m.from(), m.to()
+			from, to, flip := m.from(), m.to(), 56*p.side
 			pt := p.square[from] & 7
 			// History, plus a PST delta for moves without history
-			scores[i] = s.history[p.side][from][to] + pst[p.side][pt][to] - pst[p.side][pt][from]
+			scores[i] = s.history[p.side][from][to] + pst[pt][to^flip] - pst[pt][from^flip]
 			if prevMove != 0 && m == s.countermoves[p.side][prevMove.from()][prevMove.to()] {
 				scores[i] += ScoreCountermove
 			}
@@ -1874,14 +1841,8 @@ func (s *Searcher) quiesce(alpha, beta, ply int) int {
   ----------------------------------------------------------------------------------
    NEGAMAX SEARCH WITH ALPHA-BETA PRUNING
   ----------------------------------------------------------------------------------
-   This function explores the game tree to find the best move. It uses the Negamax
-   framework where max(a, b) = -min(-b, -a), simplifying code for 2-player zero-sum games.
-
-          [ Root Node ]
-          /     |     \
-      [Move A] [Move B] [Move C]
-        /         |        \
-     ...         ...      (Pruned?)
+   negamax scores every node for the side to move, so one function serves both sides:
+   a child's score is negated for its parent.
 
    Techniques used here, in the order they run:
    1. Check extension, then the Transposition Table (TT): reuse results of positions already searched.
@@ -2163,14 +2124,8 @@ func (s *Searcher) updateQuietStats(m Move, depth, ply int, prevMove Move, tried
   ----------------------------------------------------------------------------------
    search runs negamax to depth 1, then 2, then 3... until the depth limit or the time
    manager stops it. Each iteration leaves hash moves and history that order the next
-   one's moves better, and a stop always finds a best move from a completed iteration.
-
-   [Start]
-    Search D=1 -> BestMove A
-    Search D=2 -> BestMove A (the hash move from depth 1 is searched first)
-    Search D=3 -> BestMove B (found a better move)
-    [Time Up!] -> The unfinished iteration is thrown away; return the best move of the
-                  last completed one.
+   one's moves better. A stopped iteration is thrown away: the best move comes from the
+   last completed one.
 
    Depth 1 always completes: it ignores stop and the deadline (it takes well under a
    millisecond), so with a legal move on the board there is always a searched move to report.
@@ -2222,7 +2177,7 @@ func (s *Searcher) search(tc *TimeControl) Move {
 	var bestMove Move
 	s.ss = [MaxDepth + 1]SearchStack{}
 
-	maxDepth := tc.depth
+	maxDepth := int(tc.depth)
 	if maxDepth <= 0 || tc.infinite {
 		maxDepth = MaxDepth
 	}
@@ -2230,12 +2185,9 @@ func (s *Searcher) search(tc *TimeControl) Move {
 	// Counters and clock for this search
 	s.nodes = 0
 	s.seldepth = 0
-	start := time.Now()
-	s.start = start
-	var prevScore int
-	var prevBestMove Move
-	stableIterations := 0
-	lastIterElapsed := time.Duration(0)
+	s.start = time.Now()
+	var prevScore, stableIterations int
+	var lastIterElapsed time.Duration
 	for depth := 1; depth <= maxDepth; depth++ {
 		s.tc = tc
 		if depth == 1 {
@@ -2257,19 +2209,17 @@ func (s *Searcher) search(tc *TimeControl) Move {
 					break
 				}
 
-				if score <= low {
-					// Failed low: true score is at most this
-					s.printInfo(depth, score, s.ss[0].pv[:s.ss[0].pvLen], time.Since(start), "upperbound")
-					low -= window
-					window *= 2
-				} else if score >= high {
-					// Failed high: true score is at least this
-					s.printInfo(depth, score, s.ss[0].pv[:s.ss[0].pvLen], time.Since(start), "lowerbound")
-					high += window
-					window *= 2
-				} else {
+				if score > low && score < high {
 					break
 				}
+				bound := "lowerbound" // failed high: the true score is at least this
+				if score <= low {
+					bound, low = "upperbound", low-window // failed low: at most this
+				} else {
+					high += window
+				}
+				s.printInfo(depth, score, s.ss[0].pv[:s.ss[0].pvLen], time.Since(s.start), bound)
+				window *= 2
 
 				if window >= AspirationMaxWindow {
 					score = s.negamax(depth, -Infinity, Infinity, 0, true, 0)
@@ -2279,7 +2229,7 @@ func (s *Searcher) search(tc *TimeControl) Move {
 		} else {
 			score = s.negamax(depth, -Infinity, Infinity, 0, true, 0)
 		}
-		elapsed := time.Since(start)
+		elapsed := time.Since(s.start)
 
 		if depth > 1 && tc.shouldStop() {
 			break
@@ -2287,15 +2237,12 @@ func (s *Searcher) search(tc *TimeControl) Move {
 
 		pv := s.ss[0].pv[:s.ss[0].pvLen]
 		if len(pv) > 0 {
-			bestMove = pv[0]
-			if depth > 1 {
-				if bestMove == prevBestMove {
-					stableIterations++
-				} else {
-					stableIterations = 0
-				}
+			if pv[0] == bestMove { // at depth 1 bestMove is still 0, so the count stays 0
+				stableIterations++
+			} else {
+				stableIterations = 0
 			}
-			prevBestMove = bestMove
+			bestMove = pv[0]
 		}
 
 		// Print search info
@@ -2333,10 +2280,6 @@ func (s *Searcher) search(tc *TimeControl) Move {
   ----------------------------------------------------------------------------------
    TIME MANAGEMENT
   ----------------------------------------------------------------------------------
-   Deciding how much time to spend on a move is a hard balance.
-   - Too little: We play hasty, weak moves.
-   - Too much: We likely flag (run out of time) later in the game.
-
    Each move gets two limits, after keeping the Move Overhead back for GUI and pipe lag
    (go movetime is used as given):
    1. Soft limit (optimumMs): RemainingTime / MovesToGo + TMIncrementPct% of the increment,
@@ -2364,7 +2307,7 @@ func (tc *TimeControl) allocateTime(side int, overheadMs int64) {
 		return
 	}
 
-	t, i, mtg := tc.wtime, tc.winc, int64(tc.movestogo)
+	t, i, mtg := tc.wtime, tc.winc, tc.movestogo
 	if side == Black {
 		t, i = tc.btime, tc.binc
 	}
@@ -2430,25 +2373,11 @@ func (tc *TimeControl) shouldContinue(elapsed, iterTime time.Duration, scale flo
   ----------------------------------------------------------------------------------
    PERFT (Performance Test & Move Generation Validator)
   ----------------------------------------------------------------------------------
-   Perft is a debugging function that traverses the move tree to a specific depth
-   and counts the number of leaf nodes.
-
-   Why is this useful?
-   It verifies that the move generator (generateMovesTo, makeMove, unmakeMove) is
-   mostly bug-free. We compare the results against known values for the start position.
-
-   Example (Depth 1):
-   Start Pos -> 20 legal moves. Perft(1) should return 20.
-
-   Divide:
-   "Divide" prints the child count for *each* root move separately.
-   Perft 2 Divide Example:
-   e2e4: 20
-   e2e3: 20
-   g1f3: 20
-   --------
-   Total: 400
-   This isolates exactly which move branch contains a possible bug, if node counts differ from known results.
+   perft counts the leaf nodes of the legal move tree to a fixed depth. Matching the
+   known counts (commands\bench_positions.txt, TestPerft) shows that generateMovesTo,
+   isLegal, makeMove and unmakeMove follow the rules; divide splits the count by root
+   move to find the branch where they do not. datagen uses "divide 1" as its list of
+   legal moves.
 */
 
 // perft counts the leaf nodes of the legal move tree to depth.
@@ -2486,14 +2415,8 @@ func (p *Position) perftDivide(depth int) (moves []Move, counts []int) {
   ----------------------------------------------------------------------------------
    UCI MAIN LOOP (Universal Chess Interface)
   ----------------------------------------------------------------------------------
-   This is the communication part. The GUI (Arena, Banksia, Cutechess) sends text commands, we reply with text.
-
-   [ GUI ] -------- "position startpos moves e2e4" ---->  [ ENGINE ]
-   [ GUI ] <------- "info depth 5 score cp 20..." ------  [ ENGINE ]
-   [ GUI ] -------- "go wtime 60000" ------------------>  [ ENGINE ]
-   [ GUI ] <------- "bestmove e7e5" --------------------  [ ENGINE ]
-
-   The loop reads one command at a time. A search runs in its own goroutine, so stop
+   A GUI or match runner (Arena, Fastchess, datagen) sends one text command per line,
+   and Soomi answers in text. The loop reads one command at a time. A search runs in its own goroutine, so stop
    and isready are answered while it thinks. Every go gets exactly one bestmove, and
    go infinite gets it only after stop. Bad input is reported with "info string" and
    changes nothing.
@@ -2650,42 +2573,28 @@ func parseSetOption(parts []string) (name, value string) {
 // rest is still used: the GUI waits for a bestmove either way.
 func parseGo(args []string) (*TimeControl, error) {
 	tc := &TimeControl{}
+	values := map[string]*int64{"wtime": &tc.wtime, "btime": &tc.btime, "winc": &tc.winc,
+		"binc": &tc.binc, "movestogo": &tc.movestogo, "depth": &tc.depth, "movetime": &tc.movetime}
 	var bad []string
 	for i := 0; i < len(args); i++ {
-		name := args[i]
-		if name == "infinite" {
+		if args[i] == "infinite" {
 			tc.infinite = true
-			continue
 		}
-		if !slices.Contains([]string{"wtime", "btime", "winc", "binc", "movestogo", "depth", "movetime"}, name) {
+		dst, ok := values[args[i]]
+		if !ok {
 			continue
 		}
 		if i+1 == len(args) {
-			bad = append(bad, name+" has no value")
+			bad = append(bad, args[i]+" has no value")
 			break
 		}
 		i++
 		v, err := strconv.ParseInt(args[i], 10, 64)
 		if err != nil {
-			bad = append(bad, fmt.Sprintf("%s value %q is not a number", name, args[i]))
+			bad = append(bad, fmt.Sprintf("%s value %q is not a number", args[i-1], args[i]))
 			continue
 		}
-		switch name {
-		case "wtime":
-			tc.wtime = v
-		case "btime":
-			tc.btime = v
-		case "winc":
-			tc.winc = v
-		case "binc":
-			tc.binc = v
-		case "movestogo":
-			tc.movestogo = int(v)
-		case "depth":
-			tc.depth = int(v)
-		case "movetime":
-			tc.movetime = v
-		}
+		*dst = v
 	}
 	if len(bad) > 0 {
 		return tc, fmt.Errorf("%s", strings.Join(bad, "; "))
@@ -2821,11 +2730,7 @@ func (u *UCI) perft(parts []string) {
 		if elapsed.Seconds() > 0 {
 			nps = int64(float64(count) / elapsed.Seconds())
 		}
-		timeStr := fmt.Sprintf("%d ms", elapsed.Milliseconds())
-		if elapsed >= time.Second {
-			timeStr = fmt.Sprintf("%.2f s", elapsed.Seconds())
-		}
-		u.out.printf("%-8d %-15d %-11s %d\n", d, count, timeStr, nps)
+		u.out.printf("%-8d %-15d %-11v %d\n", d, count, elapsed.Round(time.Millisecond), nps)
 	}
 	u.out.printf("\n")
 }
@@ -2856,23 +2761,7 @@ Additional Commands:
   perft <depth>                    - Run perft test
   divide <depth>                   - Run divide test
   audit                            - Audit state handling
-  help                             - Show this help message
-
-Example Usage:
-  1. Start new game:
-     ucinewgame
-
-  2. Set position and make moves:
-     position startpos moves e2e4 e7e5 g1f3
-
-  3. Search with time control:
-     go wtime 300000 btime 300000 winc 0 binc 0
-
-  4. Search to depth 10:
-     go depth 10
-
-  5. Display current position:
-     d`
+  help                             - Show this help message`
 
 // main loads the embedded net, then runs the UCI loop on stdin and stdout.
 func main() {
