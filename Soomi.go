@@ -289,14 +289,12 @@ type Undo struct {
 	lastIrreversible int
 }
 
-// TimeControl holds one search's limits. The first eight fields come from the go
+// TimeControl holds one search's limits. The first six fields come from the go
 // command, allocateTime fills optimumMs and deadline, and stop sets stopped, which the
 // search goroutine reads atomically.
 type TimeControl struct {
-	wtime     int64 // ms left on White's and Black's clocks
-	btime     int64
-	winc      int64 // ms increment per move
-	binc      int64
+	clock     [2]int64 // ms left on each side's clock, by colour (wtime, btime)
+	inc       [2]int64 // ms increment per move, by colour (winc, binc)
 	movestogo int64
 	movetime  int64     // search exactly this many ms
 	infinite  bool      // search until stop
@@ -380,12 +378,6 @@ func relevantMask(sq int, dirs *[4][2]int) Bitboard {
 	return mask
 }
 
-// initMagicBitboards builds the rook and bishop attack tables.
-func initMagicBitboards() {
-	initMagics(&rookMagics, rookAttackTable[:], &rookMagicNumbers, &rookDirs)
-	initMagics(&bishopMagics, bishopAttackTable[:], &bishopMagicNumbers, &bishopDirs)
-}
-
 // initMagics fills one slider's entries and attack table, enumerating every
 // subset of each mask with the Carry-Rippler trick.
 func initMagics(entries *[64]MagicEntry, table []Bitboard, numbers *[64]uint64, dirs *[4][2]int) {
@@ -466,7 +458,7 @@ type TTEntry struct {
    3. The move is always used, to order moves first.
    4. At non-PV nodes the score ends the search when the entry is from this game (Gen),
       searched at least as deep, and its bound (Flag) fits alpha and beta. Mate scores
-      are stored relative to the node (scoreToTT) and used at any depth.
+      are stored relative to the node (scoreToTT) and used at any depth, from any game.
 */
 
 type TranspositionTable struct {
@@ -486,7 +478,7 @@ func initTT(sizeMB int) {
 }
 
 // newGeneration starts a new game. Entries from earlier generations still give hash
-// moves but no scores. Only 8 bits of the generation are stored, so after 255 games
+// moves, but no scores except mates (probeTT). Only 8 bits of the generation are stored, so after 255 games
 // the table is cleared and counting starts over.
 func (t *TranspositionTable) newGeneration() {
 	t.gen++
@@ -543,7 +535,8 @@ func init() {
 	initCastleMask()
 	initZobrist()
 	initAttacks()
-	initMagicBitboards()
+	initMagics(&rookMagics, rookAttackTable[:], &rookMagicNumbers, &rookDirs)
+	initMagics(&bishopMagics, bishopAttackTable[:], &bishopMagicNumbers, &bishopDirs)
 	initLMR()
 	initTT(DefaultTTSizeMB)
 }
@@ -677,6 +670,24 @@ func initZobrist() {
 	}
 }
 
+// zobristHash computes the position's hash from scratch: setFEN sets it with this,
+// and audit checks makeMove's incremental updates against it.
+func (p *Position) zobristHash() uint64 {
+	h := zobristCastleDiff[p.castle]
+	if p.side == Black {
+		h ^= zobristSide
+	}
+	if p.epSquare >= 0 {
+		h ^= zobristEP[p.epSquare%8]
+	}
+	for sq, v := range p.square {
+		if v >= 0 {
+			h ^= zobristPiece[v>>3][v&7][sq]
+		}
+	}
+	return h
+}
+
 // initAttacks fills the knight, king and pawn attack tables.
 func initAttacks() {
 	for sq := 0; sq < 64; sq++ {
@@ -722,22 +733,22 @@ func (m Move) isCapture() bool { return m.flags()&4 != 0 }
 func (m Move) isPromo() bool   { return m.flags()&8 != 0 }
 func (m Move) promoType() int  { return (m.flags() & 3) + Knight }
 
+// captureSquare is where m's captured piece stands: its target, or behind it for en passant.
+func (m Move) captureSquare() int {
+	if m.flags() == FlagEP {
+		return m.to() ^ 8
+	}
+	return m.to()
+}
+
 // String writes m in UCI notation (e2e4, e7e8q), or 0000 for no move.
 func (m Move) String() string {
 	if m == 0 {
 		return "0000"
 	}
-	var buf [5]byte
 	from, to := m.from(), m.to()
-	buf[0] = byte('a' + from%8)
-	buf[1] = byte('1' + from/8)
-	buf[2] = byte('a' + to%8)
-	buf[3] = byte('1' + to/8)
-	if m.isPromo() {
-		buf[4] = "nbrq"[m.promoType()-Knight]
-		return string(buf[:5])
-	}
-	return string(buf[:4])
+	s := [5]byte{byte('a' + from%8), byte('1' + from/8), byte('a' + to%8), byte('1' + to/8), "nbrq"[m.flags()&3]}
+	return string(s[:4+m.flags()>>3]) // the promotion letter only for flags 8-15
 }
 
 // newPosition returns a Position set to the starting position.
@@ -773,7 +784,6 @@ func (p *Position) setFEN(fen string) error {
 	case "w":
 	case "b":
 		p.side = Black
-		p.hash ^= zobristSide
 	default:
 		return fmt.Errorf("bad side to move %q", parts[1])
 	}
@@ -801,6 +811,7 @@ func (p *Position) setFEN(fen string) error {
 		}
 	}
 
+	p.hash = p.zobristHash()
 	p.historyKeys[0] = p.hash
 	p.nnRefresh(&p.acc[0], White)
 	p.nnRefresh(&p.acc[0], Black)
@@ -830,7 +841,6 @@ func (p *Position) parseBoard(board string) error {
 			file++
 			p.toggle(color, pt, squareBB(sq))
 			p.square[sq] = (color << 3) | pt
-			p.hash ^= zobristPiece[color][pt][sq]
 		}
 		if file != 8 {
 			return fmt.Errorf("bad rank %q", rank)
@@ -867,7 +877,6 @@ func (p *Position) parseCastling(rights string) error {
 			return fmt.Errorf("castling right %c without its king and rook at home", "KQkq"[i])
 		}
 	}
-	p.hash ^= zobristCastleDiff[p.castle]
 	return nil
 }
 
@@ -885,7 +894,6 @@ func (p *Position) parseEnPassant(ep string) error {
 	if p.square[p.epSquare] != -1 || p.square[p.epSquare^8] != (p.side^1)<<3|Pawn {
 		return fmt.Errorf("en passant square %s is not behind a pawn that just moved two squares", ep)
 	}
-	p.hash ^= zobristEP[p.epSquare%8]
 	return nil
 }
 
@@ -912,12 +920,18 @@ func (p *Position) setPosition(args []string) error {
 		if !found {
 			return fmt.Errorf("illegal move %s", s)
 		}
-		p.makeMove(m)
-		if p.historyPly > MaxGamePly-1-MaxDepth {
-			p.rebaseHistory()
-		}
+		p.playMove(m)
 	}
 	return nil
+}
+
+// playMove makes a game move, one that is never taken back, and rebases the history
+// before the game outgrows it (rebaseHistory).
+func (p *Position) playMove(m Move) {
+	p.makeMove(m)
+	if p.historyPly > MaxGamePly-1-MaxDepth {
+		p.rebaseHistory()
+	}
 }
 
 // findMove returns the legal move written as s in UCI notation (e2e4, e7e8q).
@@ -1113,11 +1127,7 @@ func (p *Position) isLegal(m Move) bool {
 
 	capBB := Bitboard(0)
 	if m.isCapture() {
-		capSq := to
-		if flags == FlagEP {
-			capSq ^= 8
-		}
-		capBB = squareBB(capSq)
+		capBB = squareBB(m.captureSquare())
 	}
 
 	occ2 := (p.all &^ fromBB &^ capBB) | toBB
@@ -1168,39 +1178,17 @@ func (p *Position) makeMove(m Move) Undo {
 	movingPiece := p.square[from] & 7
 
 	if flags&FlagCapture != 0 {
-		capSq := to
-		if flags == FlagEP {
-			capSq ^= 8
-		}
-		capturedPiece := p.square[capSq] & 7
-		undo.captured = capturedPiece
-
-		p.toggle(them, capturedPiece, squareBB(capSq))
-		h ^= zobristPiece[them][capturedPiece][capSq]
-		d.removed(them, capturedPiece, capSq)
+		capSq := m.captureSquare()
+		captured := p.square[capSq] & 7
+		undo.captured = captured
+		p.toggle(them, captured, squareBB(capSq))
+		h ^= zobristPiece[them][captured][capSq]
+		d.removed(them, captured, capSq)
 		p.square[capSq] = -1
 	}
 
-	if flags == FlagCastle {
-		p.toggle(us, King, squareBB(from)|squareBB(to))
-		h ^= zobristPiece[us][King][from] ^ zobristPiece[us][King][to]
-		p.square[from] = -1
-		p.square[to] = (us << 3) | King
-		d.added(us, King, to)
-		d.removed(us, King, from)
-		rf, rt := from+3, from+1 // king side
-		if to < from {
-			rf, rt = from-4, from-1
-		}
-		p.toggle(us, Rook, squareBB(rf)|squareBB(rt))
-		h ^= zobristPiece[us][Rook][rf] ^ zobristPiece[us][Rook][rt]
-		d.added(us, Rook, rt)
-		d.removed(us, Rook, rf)
-		p.square[rf] = -1
-		p.square[rt] = (us << 3) | Rook
-
-	} else if flags >= FlagPromoN {
-		promoType := (flags & 3) + Knight
+	if flags >= FlagPromoN {
+		promoType := m.promoType()
 		p.toggle(us, Pawn, squareBB(from))
 		p.toggle(us, promoType, squareBB(to))
 		h ^= zobristPiece[us][Pawn][from] ^ zobristPiece[us][promoType][to]
@@ -1208,19 +1196,29 @@ func (p *Position) makeMove(m Move) Undo {
 		d.added(us, promoType, to)
 		p.square[from] = -1
 		p.square[to] = (us << 3) | promoType
-
-	} else {
+	} else { // castling moves the king here and the rook below
 		p.toggle(us, movingPiece, squareBB(from)|squareBB(to))
 		h ^= zobristPiece[us][movingPiece][from] ^ zobristPiece[us][movingPiece][to]
 		p.square[from] = -1
 		p.square[to] = (us << 3) | movingPiece
 		d.added(us, movingPiece, to)
 		d.removed(us, movingPiece, from)
-
 		if movingPiece == Pawn && abs(to-from) == 16 {
 			p.epSquare = (from + to) / 2
 			h ^= zobristEP[p.epSquare%8]
 		}
+	}
+	if flags == FlagCastle {
+		home, castled := from+3, from+1 // king side
+		if to < from {
+			home, castled = from-4, from-1
+		}
+		p.toggle(us, Rook, squareBB(home)|squareBB(castled))
+		h ^= zobristPiece[us][Rook][home] ^ zobristPiece[us][Rook][castled]
+		d.added(us, Rook, castled)
+		d.removed(us, Rook, home)
+		p.square[home] = -1
+		p.square[castled] = (us << 3) | Rook
 	}
 
 	p.castle &= castleMask[from] & castleMask[to]
@@ -1256,42 +1254,32 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 	p.epSquare = undo.epSquare
 	p.halfmove = undo.halfmove
 
-	if flags == FlagCastle {
-		p.toggle(us, King, squareBB(from)|squareBB(to))
-		p.square[to] = -1
-		p.square[from] = (us << 3) | King
-
-		rf, rt := from+1, from+3 // king side
-		if to < from {
-			rf, rt = from-1, from-4
-		}
-
-		p.toggle(us, Rook, squareBB(rf)|squareBB(rt))
-		p.square[rf] = -1
-		p.square[rt] = (us << 3) | Rook
-
-	} else if flags >= FlagPromoN {
-		promoType := (flags & 3) + Knight
+	if flags >= FlagPromoN {
+		promoType := m.promoType()
 		p.toggle(us, promoType, squareBB(to))
 		p.toggle(us, Pawn, squareBB(from))
 		p.square[to] = -1
 		p.square[from] = (us << 3) | Pawn
-
-	} else {
+	} else { // castling takes the king back here and the rook below
 		movingPt := p.square[to] & 7
 		p.toggle(us, movingPt, squareBB(from)|squareBB(to))
 		p.square[to] = -1
 		p.square[from] = (us << 3) | movingPt
 	}
+	if flags == FlagCastle {
+		home, castled := from+3, from+1 // king side
+		if to < from {
+			home, castled = from-4, from-1
+		}
+		p.toggle(us, Rook, squareBB(home)|squareBB(castled))
+		p.square[castled] = -1
+		p.square[home] = (us << 3) | Rook
+	}
 
 	if undo.captured >= 0 {
-		capSq := to
-		if flags == FlagEP {
-			capSq ^= 8
-		}
-		capturedPiece := undo.captured
-		p.toggle(them, capturedPiece, squareBB(capSq))
-		p.square[capSq] = (them << 3) | capturedPiece
+		capSq := m.captureSquare()
+		p.toggle(them, undo.captured, squareBB(capSq))
+		p.square[capSq] = (them << 3) | undo.captured
 	}
 	p.hash = p.historyKeys[p.historyPly]
 }
@@ -1299,16 +1287,11 @@ func (p *Position) unmakeMove(m Move, undo Undo) {
 // makeNullMove passes the turn, for null move pruning: the side to move, the hash, the
 // en passant square and the halfmove clock change; the pieces do not.
 func (p *Position) makeNullMove() Undo {
-	undo := Undo{
-		epSquare: p.epSquare,
-		halfmove: p.halfmove,
-	}
-
+	undo := Undo{epSquare: p.epSquare, halfmove: p.halfmove}
 	p.side ^= 1
 	p.hash ^= zobristSide
-
-	if epFile := p.epSquare; epFile != -1 {
-		p.hash ^= zobristEP[epFile%8]
+	if p.epSquare >= 0 {
+		p.hash ^= zobristEP[p.epSquare%8]
 		p.epSquare = -1
 	}
 	p.halfmove++
@@ -1332,10 +1315,8 @@ func (p *Position) unmakeNullMove(undo Undo) {
 func (p *Position) see(m Move) int {
 	from, to := m.from(), m.to()
 	var gain [32]int
-	if m.flags() == FlagEP {
-		gain[0] = pieceValues[Pawn]
-	} else if p.square[to] != -1 {
-		gain[0] = pieceValues[p.square[to]&7]
+	if v := p.square[m.captureSquare()]; v != -1 {
+		gain[0] = pieceValues[v&7]
 	}
 	piece := p.square[from] & 7
 	if m.isPromo() {
@@ -1733,10 +1714,7 @@ func (p *Position) scoreNoisy(m Move) int {
 	if seeVal < 0 {
 		return seeVal
 	}
-	victim := Pawn
-	if vt := p.square[m.to()]; vt != -1 {
-		victim = vt & 7
-	}
+	victim := p.square[m.captureSquare()] & 7
 	return ScoreCaptureBase + seeVal + pieceValues[victim]*MVVLVAWeight - pieceValues[p.square[m.from()]&7]
 }
 
@@ -2321,10 +2299,7 @@ func (tc *TimeControl) allocateTime(side int, overheadMs int64) {
 		return
 	}
 
-	t, i, mtg := tc.wtime, tc.winc, tc.movestogo
-	if side == Black {
-		t, i = tc.btime, tc.binc
-	}
+	t, i, mtg := tc.clock[side], tc.inc[side], tc.movestogo
 	if mtg <= 0 {
 		mtg = DefaultMovesToGo
 	}
@@ -2587,8 +2562,8 @@ func parseSetOption(parts []string) (name, value string) {
 // rest is still used: the GUI waits for a bestmove either way.
 func parseGo(args []string) (*TimeControl, error) {
 	tc := &TimeControl{}
-	values := map[string]*int64{"wtime": &tc.wtime, "btime": &tc.btime, "winc": &tc.winc,
-		"binc": &tc.binc, "movestogo": &tc.movestogo, "depth": &tc.depth, "movetime": &tc.movetime}
+	values := map[string]*int64{"wtime": &tc.clock[White], "btime": &tc.clock[Black], "winc": &tc.inc[White],
+		"binc": &tc.inc[Black], "movestogo": &tc.movestogo, "depth": &tc.depth, "movetime": &tc.movetime}
 	var bad []string
 	for i := 0; i < len(args); i++ {
 		if args[i] == "infinite" {
@@ -2658,7 +2633,7 @@ func (u *UCI) display() {
 		fmt.Fprintf(&b, "%d|", r+1)
 		for f := 0; f < 8; f++ {
 			if v := u.pos.square[r*8+f]; v >= 0 {
-				fmt.Fprintf(&b, " %c", "PNBRQKpnbrqk"[(v>>3)*6+v&7])
+				fmt.Fprintf(&b, " %c", "PNBRQKpnbrqk"[(v>>3)*6+(v&7)])
 			} else {
 				b.WriteString(" .")
 			}
@@ -2691,19 +2666,7 @@ func (u *UCI) audit() {
 	}
 	report(occ == p.all, "Bitboard occupancy", fmt.Sprintf("BITBOARD DESYNC: pos.all (%x) != calculated (%x)", p.all, occ))
 
-	hash := uint64(0)
-	if p.side == Black {
-		hash ^= zobristSide
-	}
-	hash ^= zobristCastleDiff[p.castle]
-	if p.epSquare != -1 {
-		hash ^= zobristEP[p.epSquare%8]
-	}
-	for sq, v := range p.square {
-		if v >= 0 {
-			hash ^= zobristPiece[v>>3][v&7][sq]
-		}
-	}
+	hash := p.zobristHash()
 	report(hash == p.hash, "Zobrist hash", fmt.Sprintf("HASH DESYNC: pos.hash (%x) != calculated (%x)", p.hash, hash))
 
 	p.nnBuild()
