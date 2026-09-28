@@ -96,6 +96,9 @@ const (
 	DeltaMargin          = 150   // quiescence delta pruning
 	MaxHistory           = 16384 // history scores stay within +-this (updateHistory)
 	HistoryBonusMax      = 400   // largest single history update
+	CorrHistBits         = 14    // correction history: 2^14 pawn-structure slots per side
+	CorrHistGrain        = 256   // its entries hold centipawns x this
+	CorrHistMax          = 16384 // 64 cp x CorrHistGrain: corrections stay within +-64 cp (learnCorrection)
 )
 
 // Move ordering scores, highest first: hash move, promotions, captures that do not lose
@@ -322,6 +325,9 @@ type Searcher struct {
 	// history[side][from][to] rises when a quiet move causes a cutoff and falls when it
 	// was searched before another quiet move that did (updateHistory).
 	history [2][64][64]int
+	// corrHist[side][pawnSlot]: how far search results tend to fall from the static eval
+	// with these pawns on the board, in centipawns x CorrHistGrain (learnCorrection).
+	corrHist [2][1 << CorrHistBits]int16
 	// countermoves[side][from][to] of the previous move: the quiet move that last refuted it.
 	countermoves [2][64][64]Move
 	nodes        int64
@@ -1382,6 +1388,34 @@ func (s *Searcher) updateHistory(side, from, to, bonus int) {
 	s.history[side][from][to] += bonus - s.history[side][from][to]*abs(bonus)/MaxHistory
 }
 
+// pawnSlot hashes both sides' pawns to a correction history slot: the top bits of
+// a multiplication depend on every pawn.
+func (p *Position) pawnSlot() int {
+	h := uint64(p.pieces[White][Pawn])*0x9E3779B97F4A7C15 ^ uint64(p.pieces[Black][Pawn])*0xD6E8FEB86659FD93
+	return int(h >> (64 - CorrHistBits))
+}
+
+// correctedEval adds this pawn structure's learned correction to the static eval
+// raw, kept out of the mate range like evaluate's own result.
+func (s *Searcher) correctedEval(raw int) int {
+	c := raw + int(s.corrHist[s.pos.side][s.pos.pawnSlot()])/CorrHistGrain
+	return max(-(Mate - MateScoreGuard - 1), min(Mate-MateScoreGuard-1, c))
+}
+
+// learnCorrection nudges this pawn structure's correction by the search result's
+// distance from the corrected static eval, scaled by depth, with the same gravity as
+// updateHistory. Not in check, and only from quiet (or no) best moves, non-mate
+// scores, and bounds that put the true score on that side of eval.
+func (s *Searcher) learnCorrection(depth, score, eval int, flag uint8, best Move, inCheck bool) {
+	if inCheck || best.isCapture() || best.isPromo() || abs(score) >= Mate-MateScoreGuard ||
+		flag == TTFlagLower && score <= eval || flag == TTFlagUpper && score >= eval {
+		return
+	}
+	e := &s.corrHist[s.pos.side][s.pos.pawnSlot()]
+	bonus := max(-CorrHistMax/4, min(CorrHistMax/4, (score-eval)*depth))
+	*e += int16(bonus - int(*e)*abs(bonus)/CorrHistMax)
+}
+
 /*
   ----------------------------------------------------------------------------------
    NNUE EVALUATION
@@ -1638,9 +1672,10 @@ func (p *Position) evaluate() int {
                           negative SEE, so they sort among the quiets with poor history.
 */
 
-// clearHeuristics forgets the history and countermoves, for a new game.
+// clearHeuristics forgets the history, corrections and countermoves, for a new game.
 func (s *Searcher) clearHeuristics() {
 	s.history = [2][64][64]int{}
+	s.corrHist = [2][1 << CorrHistBits]int16{}
 	s.countermoves = [2][64][64]Move{}
 }
 
@@ -1750,7 +1785,7 @@ func (s *Searcher) quiesce(alpha, beta, ply int) int {
 	inCheck := p.inCheck()
 	best := alpha
 	if !inCheck {
-		stand := p.evaluate()
+		stand := s.correctedEval(p.evaluate())
 		if stand >= beta {
 			return stand
 		}
@@ -1827,6 +1862,8 @@ func (s *Searcher) quiesce(alpha, beta, ply int) int {
    4. Late Move Pruning (LMP) and SEE pruning: skip late quiet moves and losing moves at low depth.
    5. Principal Variation Search (PVS) with Late Move Reductions (LMR).
    6. Quiescence Search: At leaf nodes, play out captures to avoid "horizon effects".
+   The static eval behind RFP and stand pat is corrected by correction history: what
+   the search found about earlier positions with the same pawns (learnCorrection).
 
    Alpha (α): the score the side to move is already sure of elsewhere; a move that
               cannot beat it changes nothing.
@@ -1890,8 +1927,10 @@ func (s *Searcher) negamax(depth, alpha, beta, ply int, pvNode bool, prevMove Mo
 	}
 
 	// Node pruning never runs in check: a null move there would leave the king capturable
+	eval := 0 // corrected static eval (correctedEval); not computed in check
 	if !inCheck {
-		if score, cutoff := s.pruneNode(depth, beta, ply, prevMove); cutoff {
+		eval = s.correctedEval(p.evaluate())
+		if score, cutoff := s.pruneNode(depth, beta, ply, eval, prevMove); cutoff {
 			return score
 		}
 	}
@@ -1936,6 +1975,7 @@ func (s *Searcher) negamax(depth, alpha, beta, ply int, pvNode bool, prevMove Mo
 			if isQuiet && m != hashMove {
 				s.updateQuietStats(m, depth, ply, prevMove, quietsTried[:quietCount-1])
 			}
+			s.learnCorrection(depth, score, eval, TTFlagLower, m, inCheck)
 			tt.save(p.hash, m, scoreToTT(score, ply), depth, TTFlagLower)
 			return score
 		}
@@ -1966,6 +2006,7 @@ func (s *Searcher) negamax(depth, alpha, beta, ply int, pvNode bool, prevMove Mo
 	if bestScore <= origAlpha {
 		flag = TTFlagUpper
 	}
+	s.learnCorrection(depth, bestScore, eval, flag, bestMove, inCheck)
 	tt.save(p.hash, bestMove, scoreToTT(bestScore, ply), depth, flag)
 	return bestScore
 }
@@ -1988,18 +2029,16 @@ func (s *Searcher) probeTT(depth, alpha, beta, ply int, pvNode bool) (Move, int,
 }
 
 // pruneNode tries to cut a node that is not in check before its moves are searched:
-// RFP when the static eval is far above beta, then a null move search, then ProbCut.
-// In endgames (isEndgame) none of them runs.
-func (s *Searcher) pruneNode(depth, beta, ply int, prevMove Move) (int, bool) {
+// RFP when eval, the corrected static eval, is far above beta, then a null move
+// search, then ProbCut. In endgames (isEndgame) none of them runs.
+func (s *Searcher) pruneNode(depth, beta, ply, eval int, prevMove Move) (int, bool) {
 	p := &s.pos
 	if p.isEndgame() {
 		return 0, false
 	}
 	// Reverse futility pruning: the static eval beats beta by a margin that grows with depth
-	if depth <= RFPDepthMax {
-		if eval := p.evaluate(); eval >= beta+RFPMargin*depth {
-			return eval, true // soft fail
-		}
+	if depth <= RFPDepthMax && eval >= beta+RFPMargin*depth {
+		return eval, true // soft fail
 	}
 	// Null move pruning: if the side to move can pass and still reach beta in a reduced
 	// search, a real move almost always would too. Zugzwang is the exception.
