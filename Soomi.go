@@ -163,8 +163,9 @@ var (
 	lmrTable          [MaxDepth + 1][MaxMoves]int // LMR reduction by [depth][move number] (initLMR)
 	// The order SEE tries attackers in.
 	lvaOrder = [6]int{Pawn, Bishop, Knight, Rook, Queen, King}
-	// Castling rights kept by a move from or to each square (initCastleMask).
-	castleMask [64]int
+	// Castling rights (1 K, 2 Q, 4 k, 8 q) lost by a move from or to each square: the
+	// rook squares lose their own right, e1 and e8 both of that side's.
+	castleLoss = [64]int{7: 1, 0: 2, 63: 4, 56: 8, 4: 1 | 2, 60: 4 | 8}
 )
 
 /*
@@ -448,9 +449,6 @@ type TTEntry struct {
 
    Structure of an Entry (Packed into 64 bits):
    [    Move (32b)    ] [ Score (16b) ] [ Gen (8b) ] [ Depth (6b) ] [ Flag (2b) ]
-   ^
-   |
-   (Upper 32 bits store the Move)
 
    Lookup (probe, then probeTT in the search):
    1. Index = Hash & (TableSize - 1); the size is a power of 2.
@@ -478,8 +476,8 @@ func initTT(sizeMB int) {
 }
 
 // newGeneration starts a new game. Entries from earlier generations still give hash
-// moves, but no scores except mates (probeTT). Only 8 bits of the generation are stored, so after 255 games
-// the table is cleared and counting starts over.
+// moves, but no scores except mates (probeTT). Only 8 bits of the generation are
+// stored, so after 255 games the table is cleared and counting starts over.
 func (t *TranspositionTable) newGeneration() {
 	t.gen++
 	if t.gen > 255 {
@@ -532,7 +530,6 @@ func (t *TranspositionTable) hashfull() int {
 
 // init builds every lookup table and the default transposition table; main loads the net.
 func init() {
-	initCastleMask()
 	initZobrist()
 	initAttacks()
 	initMagics(&rookMagics, rookAttackTable[:], &rookMagicNumbers, &rookDirs)
@@ -541,23 +538,11 @@ func init() {
 	initTT(DefaultTTSizeMB)
 }
 
-// initCastleMask sets which castling rights survive a move from or to each square: a1,
-// h1, a8 and h8 lose that rook's right, e1 and e8 both rights of that side.
-func initCastleMask() {
-	for i := 0; i < 64; i++ {
-		castleMask[i] = 15
-	}
-	castleMask[0], castleMask[7] = 13, 14
-	castleMask[56], castleMask[63] = 7, 11
-	castleMask[4], castleMask[60] = 12, 3
-}
-
 // initLMR fills lmrTable with the formula beside LMRDivisor, rounded down.
 func initLMR() {
 	for d := 1; d <= MaxDepth; d++ {
 		for m := 1; m < MaxMoves; m++ {
-			val := LMRBase + math.Log(float64(d))*math.Log(float64(m))/LMRDivisor
-			lmrTable[d][m] = int(val)
+			lmrTable[d][m] = int(LMRBase + math.Log(float64(d))*math.Log(float64(m))/LMRDivisor)
 		}
 	}
 }
@@ -729,8 +714,8 @@ func newMove(from, to, flags int) Move {
 func (m Move) from() int       { return int(m) & 63 }
 func (m Move) to() int         { return int(m>>6) & 63 }
 func (m Move) flags() int      { return int(m >> 12) }
-func (m Move) isCapture() bool { return m.flags()&4 != 0 }
-func (m Move) isPromo() bool   { return m.flags()&8 != 0 }
+func (m Move) isCapture() bool { return m.flags()&FlagCapture != 0 }
+func (m Move) isPromo() bool   { return m.flags()&FlagPromoN != 0 }
 func (m Move) promoType() int  { return (m.flags() & 3) + Knight }
 
 // captureSquare is where m's captured piece stands: its target, or behind it for en passant.
@@ -1221,7 +1206,7 @@ func (p *Position) makeMove(m Move) Undo {
 		p.square[castled] = (us << 3) | Rook
 	}
 
-	p.castle &= castleMask[from] & castleMask[to]
+	p.castle &^= castleLoss[from] | castleLoss[to]
 	d.kingSq, d.ready = [2]int8{int8(p.kingSquare(White)), int8(p.kingSquare(Black))}, [2]bool{}
 	// A king crossing files d/e flips its own view's mirroring: rebuild that view now,
 	// while the board is at this ply. The other view stays lazy.
@@ -1403,13 +1388,13 @@ func (s *Searcher) learnCorrection(depth, score, eval int, flag uint8, best Move
   ----------------------------------------------------------------------------------
    A small neural network trained on Soomi's own self-play games (nnue\DESIGN.md).
 
-   board -> 768 inputs -> 128 sums x 2 views (SCReLU) -> 1 of 8 output buckets -> cp
+   board -> 768 inputs -> 256 sums x 2 views (SCReLU) -> 1 of 8 output buckets -> cp
 
    Inputs:  one on/off feature per (colour, piece, square) as seen by one side:
             own pieces 0-5, enemy pieces 6-11. Black's view is flipped top to bottom,
             and a view whose own king stands on files e-h is also flipped left to
             right, so every view sees its own king on files a-d.
-   Sums:    128 per view (the accumulator), same weights for both views. makeMove only
+   Sums:    256 per view (the accumulator), same weights for both views. makeMove only
             records which features changed; evaluate applies the pending changes
             forward from the last built ply, so nodes that never evaluate cost nothing.
             unmakeMove just steps historyPly back.
@@ -1422,7 +1407,7 @@ func (s *Searcher) learnCorrection(depth, score, eval int, flag uint8, best Move
 
 const (
 	NNInputs  = 768
-	NNHidden  = 128
+	NNHidden  = 256
 	NNBuckets = 8
 	NNQA      = 255 // accumulator weights and biases are stored x255
 	NNQB      = 64  // output weights are stored x64
@@ -1612,7 +1597,8 @@ func (p *Position) evaluate() int {
 	sum := 0
 	if nnSIMD {
 		// Clamp to 0..255 and multiply by the weight (fits int16: 255*128), then
-		// VPMADDWD multiplies by the clamped value again and sums pairs into int32.
+		// VPMADDWD multiplies by the clamped value again and sums pairs into int32. Each
+		// lane adds NNHidden/4 products of at most 255*255*128: fine up to NNHidden 1024.
 		zero, top, s := archsimd.BroadcastInt16x16(0), archsimd.BroadcastInt16x16(NNQA), archsimd.BroadcastInt32x8(0)
 		for half, view := range [2]int{p.side, p.side ^ 1} {
 			a, w := acc[view][:], nnOutW[b][half*NNHidden:]
@@ -1641,8 +1627,6 @@ func (p *Position) evaluate() int {
   ----------------------------------------------------------------------------------
    MOVE ORDERING
   ----------------------------------------------------------------------------------
-   To prune the search tree effectively, we must search the best moves first.
-
    Sorting Priority List:
    1. Hash Move       --> The best move stored in the transposition table
    2. Promotions      --> By the value of the promoted piece
@@ -1788,11 +1772,9 @@ func (s *Searcher) quiesce(alpha, beta, ply int) int {
 	}
 
 	var movesArr [MaxMoves]Move
-	n := p.generateMovesTo(movesArr[:], !inCheck)
-	moves := movesArr[:n]
-	var stackScores [MaxMoves]int
-	scores := stackScores[:n]
-	p.orderMovesQ(moves, scores)
+	var scores [MaxMoves]int
+	moves := movesArr[:p.generateMovesTo(movesArr[:], !inCheck)]
+	p.orderMovesQ(moves, scores[:len(moves)])
 
 	legalCount := 0
 	for i, m := range moves {
@@ -2169,7 +2151,7 @@ func (s *Searcher) search(tc *TimeControl) Move {
 	var bestMove Move
 	s.ss = [MaxDepth + 1]SearchStack{}
 
-	maxDepth := int(tc.depth)
+	maxDepth := min(int(tc.depth), MaxDepth) // no iteration goes deeper than MaxDepth
 	if maxDepth <= 0 || tc.infinite {
 		maxDepth = MaxDepth
 	}
@@ -2318,8 +2300,8 @@ func (tc *TimeControl) allocateTime(side int, overheadMs int64) {
 // shouldStop reports whether stop was called or the hard deadline has passed. The search
 // asks every NodeCheckMaskSearch+1 nodes and after each searched move.
 func (tc *TimeControl) shouldStop() bool {
-	// deadline is unset or built from time.Now(), so comparing with time.Time{} equals IsZero here
-	// and keeps this inlinable
+	// deadline is unset or built from time.Now(), so comparing with time.Time{} equals
+	// IsZero here and keeps this inlinable
 	return atomic.LoadInt32(&tc.stopped) != 0 || (tc.deadline != time.Time{} && time.Until(tc.deadline) <= 0)
 }
 
@@ -2332,30 +2314,15 @@ func (tc *TimeControl) shouldContinue(elapsed, iterTime time.Duration, scale flo
 	if atomic.LoadInt32(&tc.stopped) != 0 {
 		return false
 	}
-
 	if tc.infinite || tc.depth > 0 || tc.movetime > 0 || tc.optimumMs <= 0 {
 		return true
 	}
-
 	softTarget := time.Duration(float64(tc.optimumMs)*scale) * time.Millisecond
-
-	// 1. Clean stop if soft time budget has been reached
-	if elapsed >= softTarget {
-		return false
-	}
-
-	// 2. Safety check against emergency hard deadline
 	remainHard := time.Until(tc.deadline)
-	if remainHard <= ContinueMargin {
-		return false
-	}
-
-	// 3. Project next iteration time from the completed iteration
-	if next := iterTime * TMNextIterationFactor; iterTime > 0 && (elapsed+next > softTarget*TMSoftOverrunPct/100 || next+ContinueMargin > remainHard) {
-		return false
-	}
-
-	return true
+	next := iterTime * TMNextIterationFactor // the next iteration, projected from this one
+	// Before the soft limit, not close to the hard one, and the next iteration fits both
+	return elapsed < softTarget && remainHard > ContinueMargin &&
+		(iterTime <= 0 || (elapsed+next <= softTarget*TMSoftOverrunPct/100 && next+ContinueMargin <= remainHard))
 }
 
 /*
@@ -2405,10 +2372,10 @@ func (p *Position) perftDivide(depth int) (moves []Move, counts []int) {
    UCI MAIN LOOP (Universal Chess Interface)
   ----------------------------------------------------------------------------------
    A GUI or match runner (Arena, Fastchess, datagen) sends one text command per line,
-   and Soomi answers in text. The loop reads one command at a time. A search runs in its own goroutine, so stop
-   and isready are answered while it thinks. Every go gets exactly one bestmove, and
-   go infinite gets it only after stop. Bad input is reported with "info string" and
-   changes nothing.
+   and Soomi answers in text. The loop reads one command at a time. A search runs in
+   its own goroutine, so stop and isready are answered while it thinks. Every go gets
+   exactly one bestmove, and go infinite gets it only after stop. Bad input is reported
+   with "info string" and changes nothing.
 */
 
 // UCIWriter serialises everything the engine prints: the UCI loop and the search
@@ -2751,6 +2718,5 @@ func main() {
 	uciLoop(os.Stdin, os.Stdout)
 }
 
-// Building an executable:
-// GOAMD64=v3 needs AVX2 (Intel Haswell / AMD Zen or newer); leave it out for a build that must run on any x86-64 CPU.
-// set "GOEXPERIMENT=simd" && set GOAMD64=v3 && go build -trimpath -ldflags "-s -w" -gcflags "all=-B" -o Soomi.exe Soomi.go
+// Building an executable (as the README and the .bat files do):
+// set "GOEXPERIMENT=simd" && go build -trimpath -ldflags "-s -w" -gcflags "all=-B" -o Soomi.exe Soomi.go
